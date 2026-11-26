@@ -153,7 +153,26 @@ impl Timestamp {
     /// Parses GitHub's `YYYY-MM-DDTHH:MM:SSZ`; `None` for anything else (offsets, fractions, lowercase `z`,
     /// surrounding spaces). Pure, never panics.
     pub fn parse(text: &str) -> Option<Self> {
-        todo!("dev[client]: validate {text:?} as described on Timestamp")
+        let b = text.as_bytes();
+        // Digit positions and separators of `YYYY-MM-DDTHH:MM:SSZ`; checking bytes also rules out non-ASCII text.
+        let shape_ok = b.len() == 20
+            && b.iter().enumerate().all(|(i, &c)| match i {
+                4 | 7 => c == b'-',
+                10 => c == b'T',
+                13 | 16 => c == b':',
+                19 => c == b'Z',
+                _ => c.is_ascii_digit(),
+            });
+        if !shape_ok {
+            return None;
+        }
+        let field = |at: usize| u32::from(b[at] - b'0') * 10 + u32::from(b[at + 1] - b'0');
+        let in_range = (1..=12).contains(&field(5))
+            && (1..=31).contains(&field(8))
+            && field(11) <= 23
+            && field(14) <= 59
+            && field(17) <= 59;
+        in_range.then(|| Self(text.to_owned()))
     }
 
     /// The text as GitHub sent it, `YYYY-MM-DDTHH:MM:SSZ`.
@@ -229,8 +248,77 @@ pub struct PullRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::RepoName;
+    use super::{RepoName, Timestamp};
     use crate::Error;
+
+    #[test]
+    fn timestamp_accepts_the_documented_shape_and_exposes_the_date() {
+        let t = Timestamp::parse("2011-01-26T19:01:12Z").expect("valid");
+        assert_eq!(t.as_str(), "2011-01-26T19:01:12Z");
+        assert_eq!(t.to_string(), "2011-01-26T19:01:12Z");
+        assert_eq!(t.date(), "2011-01-26");
+    }
+
+    #[test]
+    fn timestamp_bounds_of_each_field() {
+        for ok in [
+            "0000-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+            "2026-02-30T00:00:00Z", // calendar validity of the day is not checked
+        ] {
+            assert!(Timestamp::parse(ok).is_some(), "{ok} should be accepted");
+        }
+        for bad in [
+            "2026-00-01T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-01-32T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:60Z",
+        ] {
+            assert!(Timestamp::parse(bad).is_none(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn timestamp_refuses_offsets_fractions_lowercase_z_and_spaces() {
+        for bad in [
+            "2026-01-01T00:00:00+02:00",
+            "2026-01-01T00:00:00.123Z",
+            "2026-01-01T00:00:00z",
+            "2026-01-01t00:00:00Z",
+            "2026-01-01 00:00:00Z",
+            " 2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z ",
+            "2026-01-01T00:00:00Z\n",
+            "2026-01-01T00:00:00",
+            "2026-01-01",
+            "",
+            "2026/01/01T00:00:00Z",
+            "2026-01-01T00-00-00Z",
+            "+026-01-01T00:00:00Z",
+            "2026-0a-01T00:00:00Z",
+            "２０２６-01-01T00:00:00Z",
+        ] {
+            assert!(Timestamp::parse(bad).is_none(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn timestamp_never_panics_and_orders_chronologically() {
+        // Multi-byte characters must not cause a slicing panic.
+        for text in [
+            "é".repeat(20),
+            "é".repeat(10),
+            "2026-01-01T00:00:0éZ".to_owned(),
+        ] {
+            assert!(Timestamp::parse(&text).is_none());
+        }
+        let early = Timestamp::parse("2025-12-31T23:59:59Z").unwrap();
+        let late = Timestamp::parse("2026-01-01T00:00:00Z").unwrap();
+        assert!(early < late);
+    }
 
     fn invalid(owner: &str, name: &str) {
         assert!(

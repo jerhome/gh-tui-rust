@@ -119,8 +119,7 @@ impl Client {
         self.paginate(
             url,
             |body| decode_repos(body, secret),
-            // GitHub compares names ASCII case-insensitively (RepoName::same_repo).
-            |repo| repo.name.to_string().to_ascii_lowercase(),
+            |repo| repo.name.repo_key(),
         )
         .await
     }

@@ -2,7 +2,7 @@
 
 mod support;
 
-use gh_fake::{Access, Method, Repo, State, User};
+use gh_fake::{Access, Failure, FailureResponse, Method, Repo, State, User};
 use ghu::KeyCode;
 use support::{Harness, TestEnv};
 
@@ -121,7 +121,6 @@ async fn opening_owner_name_pins_it_and_saves_the_file() {
 }
 
 #[tokio::test]
-#[ignore = "needs a way to push a screen from View::apply (ui.rs, architecte)"]
 async fn opening_owner_name_opens_its_pull_requests() {
     let mut app = Harness::start(state()).await;
     app.settle().await;
@@ -267,6 +266,33 @@ async fn a_missing_repo_shows_a_message_keeps_the_input_and_pins_nothing() {
 }
 
 #[tokio::test]
+async fn a_forbidden_repo_shows_a_clear_message_keeps_the_input_and_pins_nothing() {
+    let mut state = state();
+    state.failures.push(Failure {
+        method: Method::Get,
+        path: "/repos/secret/vault".into(),
+        response: FailureResponse::Forbidden {
+            message: "Resource not accessible by personal access token".into(),
+        },
+        remaining: None,
+    });
+    let mut app = Harness::start(state).await;
+    app.settle().await;
+    open(&mut app, "secret/vault").await;
+    let screen = app.screen();
+    assert!(
+        screen.contains("Cannot open secret/vault: GitHub denied access (403)"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Open repo (owner/name): secret/vault"),
+        "{screen}"
+    );
+    assert!(!screen.contains("secret/vault [pinned]"), "{screen}");
+    assert!(!app.pinned_file().exists());
+}
+
+#[tokio::test]
 async fn a_malformed_name_is_refused_without_a_request() {
     let mut app = Harness::start(state()).await;
     app.settle().await;
@@ -393,4 +419,38 @@ async fn r_reloads_the_pinned_repos_too() {
     app.press(KeyCode::Char('r'));
     app.settle().await;
     assert_eq!(repo_requests(&app, "/repos/carol/public-lib"), 2);
+}
+
+#[tokio::test]
+async fn a_failed_open_names_what_was_sent_not_what_is_typed_since() {
+    let mut app = Harness::start(state()).await;
+    app.settle().await;
+    app.press(KeyCode::Char('o'));
+    app.type_text("alice/x");
+    app.press(KeyCode::Enter);
+    // Typed while the request is in flight: the notice must still name `alice/x`.
+    app.type_text("yz");
+    app.settle().await;
+    let screen = app.screen();
+    assert!(screen.contains("Cannot open alice/x:"), "{screen}");
+    assert!(!screen.contains("Cannot open alice/xyz"), "{screen}");
+    assert!(
+        screen.contains("Open repo (owner/name): alice/xyz"),
+        "the prompt keeps what is typed:\n{screen}"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_repo_loaded_under_another_case_is_saved_under_the_canonical_name() {
+    let mut state = state();
+    state.repos.push(Repo::new("bob", "tools"));
+    let mut app = Harness::start_with(state, |env, _| {
+        write_pins(env, "pinned = [\"Bob/Tools\"]\n")
+    })
+    .await;
+    app.settle().await;
+    let text = pinned_file_text(&app);
+    assert!(text.contains("pinned = [\"bob/tools\"]"), "{text}");
+    let screen = app.screen();
+    assert!(screen.contains("bob/tools [pinned]"), "{screen}");
 }

@@ -51,6 +51,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::keys::{self, Binding, HelpRow};
+use super::list::{Content, Selection};
+use super::pulls::PullsScreen;
 use super::{Flow, Notice, Outcome, RequestId, Shared, View, error_message};
 use crate::pins::{PinStore, PinsError};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
@@ -130,16 +132,6 @@ const TABLE: [Binding<Action>; 8] = [
     },
 ];
 
-/// The affiliated repos (`Client::user_repos`).
-enum Content {
-    /// The first answer has not come yet.
-    Loading,
-    /// The repos, in GitHub's order.
-    Loaded(Vec<Repo>),
-    /// The request failed: a message for the user.
-    Failed(String),
-}
-
 /// What is known of one Pinned repo.
 enum PinLoad {
     /// Its `Client::repo` answer has not come yet.
@@ -161,11 +153,17 @@ struct PinEntry {
 }
 
 /// The text field that has the focus, if any.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     None,
     Filter,
-    Prompt,
+    Prompt(Prompt),
+}
+
+/// The `owner/name` prompt: its text, and the request in flight with the name that was sent (what the user
+/// typed since does not change what a failure reports).
+struct Prompt {
+    text: String,
+    pending: Option<(RequestId, RepoName)>,
 }
 
 /// One visible row.
@@ -177,20 +175,17 @@ struct Row<'a> {
 
 /// The Repo list screen.
 pub(crate) struct RepoListScreen {
-    content: Content,
+    /// The affiliated repos (`Client::user_repos`), in GitHub's order.
+    content: Content<Repo>,
     pending: Option<RequestId>,
     pins: PinStore,
     /// One entry per Pinned repo of `pins`, same order.
     pin_entries: Vec<PinEntry>,
     show_archived: bool,
     filter: String,
-    /// The `owner/name` prompt; `Some` while it is open.
-    prompt: Option<String>,
-    /// The `owner/name` request in flight, with the name typed.
-    pending_open: Option<RequestId>,
     focus: Focus,
     /// Index into the visible rows.
-    selected: usize,
+    selected: Selection,
 }
 
 impl RepoListScreen {
@@ -220,10 +215,8 @@ impl RepoListScreen {
             pin_entries,
             show_archived: false,
             filter: String::new(),
-            prompt: None,
-            pending_open: None,
             focus: Focus::None,
-            selected: 0,
+            selected: Selection::default(),
         };
         screen.load(shared);
         screen
@@ -245,10 +238,7 @@ impl RepoListScreen {
     /// The visible rows: Pinned repos in pin order, then the affiliated ones not pinned, in GitHub's order;
     /// archived ones hidden unless pinned or shown; filtered by name.
     fn rows(&self) -> Vec<Row<'_>> {
-        let affiliated: &[Repo] = match &self.content {
-            Content::Loaded(repos) => repos,
-            Content::Loading | Content::Failed(_) => &[],
-        };
+        let affiliated = self.content.items();
         let pinned = self.pin_entries.iter().map(|entry| match &entry.load {
             PinLoad::Loaded(repo) => Row {
                 name: &repo.name,
@@ -280,15 +270,19 @@ impl RepoListScreen {
     }
 
     fn selected_name(&self) -> Option<RepoName> {
-        self.rows().get(self.selected).map(|row| row.name.clone())
+        self.rows()
+            .get(self.selected.index())
+            .map(|row| row.name.clone())
     }
 
     /// After the rows changed: keeps the selection on `previous` if still visible, else the first row.
     fn reselect(&mut self, previous: Option<RepoName>) {
         let rows = self.rows();
-        self.selected = previous
-            .and_then(|name| rows.iter().position(|row| row.name.same_repo(&name)))
-            .unwrap_or(0);
+        self.selected.set(
+            previous
+                .and_then(|name| rows.iter().position(|row| row.name.same_repo(&name)))
+                .unwrap_or(0),
+        );
     }
 
     /// Applies `change` to the screen, keeping the selection on the same repo if it stays visible.
@@ -301,7 +295,7 @@ impl RepoListScreen {
     /// `Enter` on the Repo list: the selected repo's PRs, or the error of a pinned repo that failed to load.
     fn open_selected(&self, shared: &mut Shared) -> Flow {
         let rows = self.rows();
-        let Some(row) = rows.get(self.selected) else {
+        let Some(row) = rows.get(self.selected.index()) else {
             return Flow::Handled;
         };
         if let Some(repo) = row.repo {
@@ -322,7 +316,7 @@ impl RepoListScreen {
 
     fn unpin_selected(&mut self, shared: &mut Shared) {
         let rows = self.rows();
-        let Some(row) = rows.get(self.selected) else {
+        let Some(row) = rows.get(self.selected.index()) else {
             return;
         };
         let name = row.name.clone();
@@ -345,23 +339,26 @@ impl RepoListScreen {
 
     /// `Enter` in the prompt: validates the name, then asks GitHub for it.
     fn submit_prompt(&mut self, shared: &mut Shared) {
-        let text = self.prompt.as_deref().unwrap_or_default();
-        let Ok(name) = text.parse::<RepoName>() else {
+        let Focus::Prompt(prompt) = &mut self.focus else {
+            return;
+        };
+        let Ok(name) = prompt.text.parse::<RepoName>() else {
             shared.notify(Notice::Error(
                 "Invalid repo name: type owner/name.".to_owned(),
             ));
             return;
         };
         let client = shared.client().clone();
-        self.pending_open =
-            Some(shared.spawn(async move { Outcome::Repo(client.repo(&name).await) }));
+        let sent = name.clone();
+        let id = shared.spawn(async move { Outcome::Repo(client.repo(&name).await) });
+        prompt.pending = Some((id, sent));
     }
 
     /// A repo opened by name was found: pin it under GitHub's name and show it among the pinned.
     fn opened(&mut self, repo: Repo, shared: &mut Shared) {
-        self.prompt = None;
         self.focus = Focus::None;
         let name = repo.name.clone();
+        let opened_repo = repo.clone();
         match self.pins.pin(name.clone()) {
             Ok(_) => {
                 self.keeping_selection(|screen| {
@@ -386,13 +383,13 @@ impl RepoListScreen {
             }
             Err(error) => shared.notify(Notice::Error(error.to_string())),
         }
-        // The PR list of the repo should open here (ADR 0002 § Repo list), but `View::apply` cannot push a screen:
-        // requested from the architecte.
+        let pulls = PullsScreen::new(opened_repo, shared);
+        shared.push(Box::new(pulls));
     }
 
     /// Keys while a text field has the focus.
     fn edit_key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
-        match (self.focus, key.code) {
+        match (&mut self.focus, key.code) {
             (Focus::Filter, KeyCode::Enter) => self.focus = Focus::None,
             (Focus::Filter, KeyCode::Esc) => {
                 self.focus = Focus::None;
@@ -406,22 +403,13 @@ impl RepoListScreen {
             (Focus::Filter, KeyCode::Char(c)) if is_text(key) => {
                 self.keeping_selection(|screen| screen.filter.push(c));
             }
-            (Focus::Prompt, KeyCode::Enter) => self.submit_prompt(shared),
-            (Focus::Prompt, KeyCode::Esc) => {
-                self.prompt = None;
-                self.pending_open = None;
-                self.focus = Focus::None;
+            (Focus::Prompt(_), KeyCode::Enter) => self.submit_prompt(shared),
+            // Closing the prompt drops the request in flight: its answer is stale.
+            (Focus::Prompt(_), KeyCode::Esc) => self.focus = Focus::None,
+            (Focus::Prompt(prompt), KeyCode::Backspace) => {
+                prompt.text.pop();
             }
-            (Focus::Prompt, KeyCode::Backspace) => {
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.pop();
-                }
-            }
-            (Focus::Prompt, KeyCode::Char(c)) if is_text(key) => {
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.push(c);
-                }
-            }
+            (Focus::Prompt(prompt), KeyCode::Char(c)) if is_text(key) => prompt.text.push(c),
             _ => {}
         }
         Flow::Handled
@@ -430,10 +418,13 @@ impl RepoListScreen {
     /// Lines above the rows: the prompt, then the filter.
     fn field_lines(&self) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
-        if let Some(prompt) = &self.prompt {
-            lines.push(Line::from(format!(" Open repo (owner/name): {prompt}")));
+        if let Focus::Prompt(prompt) = &self.focus {
+            lines.push(Line::from(format!(
+                " Open repo (owner/name): {}",
+                prompt.text
+            )));
         }
-        if self.focus == Focus::Filter || !self.filter.is_empty() {
+        if matches!(self.focus, Focus::Filter) || !self.filter.is_empty() {
             lines.push(Line::from(format!(" Filter: {}", self.filter)));
         }
         lines
@@ -459,7 +450,7 @@ impl View for RepoListScreen {
     }
 
     fn editing(&self) -> bool {
-        self.focus != Focus::None
+        !matches!(self.focus, Focus::None)
     }
 
     fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
@@ -468,20 +459,18 @@ impl View for RepoListScreen {
         }
         let count = self.rows().len();
         match keys::lookup(&TABLE, key) {
-            Some(Action::Up) => self.selected = self.selected.saturating_sub(1),
-            Some(Action::Down) => {
-                if self.selected + 1 < count {
-                    self.selected += 1;
-                }
-            }
+            Some(Action::Up) => self.selected.up(),
+            Some(Action::Down) => self.selected.down(count),
             Some(Action::Open) => return self.open_selected(shared),
             Some(Action::Filter) => self.focus = Focus::Filter,
             Some(Action::ToggleArchived) => {
                 self.keeping_selection(|screen| screen.show_archived = !screen.show_archived);
             }
             Some(Action::OpenByName) => {
-                self.prompt = Some(String::new());
-                self.focus = Focus::Prompt;
+                self.focus = Focus::Prompt(Prompt {
+                    text: String::new(),
+                    pending: None,
+                });
             }
             Some(Action::Unpin) => self.unpin_selected(shared),
             Some(Action::Refresh) => self.load(shared),
@@ -495,13 +484,9 @@ impl View for RepoListScreen {
 
     fn paste(&mut self, text: &str, _shared: &mut Shared) {
         let first = text.lines().next().unwrap_or_default();
-        match self.focus {
+        match &mut self.focus {
             Focus::Filter => self.keeping_selection(|screen| screen.filter.push_str(first)),
-            Focus::Prompt => {
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.push_str(first.trim());
-                }
-            }
+            Focus::Prompt(prompt) => prompt.text.push_str(first.trim()),
             Focus::None => {}
         }
     }
@@ -524,15 +509,24 @@ impl View for RepoListScreen {
             self.keeping_selection(|screen| screen.content = content);
             return None;
         }
-        if self.pending_open == Some(id) {
-            self.pending_open = None;
+        let sent = match &mut self.focus {
+            Focus::Prompt(prompt)
+                if prompt
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(request, _)| *request == id) =>
+            {
+                prompt.pending.take().map(|(_, name)| name)
+            }
+            _ => None,
+        };
+        if let Some(sent) = sent {
             match outcome {
                 Outcome::Repo(Ok(repo)) => self.opened(repo, shared),
                 Outcome::Repo(Err(error)) => {
                     tracing::warn!(%error, "opening a repo failed");
-                    let typed = self.prompt.as_deref().unwrap_or_default().trim();
                     shared.notify(Notice::Error(error_message(
-                        &format!("open {typed}"),
+                        &format!("open {sent}"),
                         &error,
                     )));
                 }
@@ -564,10 +558,23 @@ impl View for RepoListScreen {
             },
             other => return Some(other),
         };
+        // A repo loaded under another case than the file's: write GitHub's canonical name back.
+        let mut canonical = None;
+        if let PinLoad::Loaded(repo) = &load
+            && repo.name != name
+        {
+            match self.pins.pin(repo.name.clone()) {
+                Ok(_) => canonical = Some(repo.name.clone()),
+                Err(error) => shared.notify(Notice::Error(error.to_string())),
+            }
+        }
         self.keeping_selection(|screen| {
             let entry = &mut screen.pin_entries[index];
             entry.pending = None;
             entry.load = load;
+            if let Some(canonical) = canonical {
+                entry.name = canonical;
+            }
         });
         None
     }
@@ -580,7 +587,7 @@ impl View for RepoListScreen {
         let mut lines = self.field_lines();
         // The focused field: the prompt is the first line, the filter the last.
         let cursor_row = match self.focus {
-            Focus::Prompt => Some(0),
+            Focus::Prompt(_) => Some(0),
             Focus::Filter => lines.len().checked_sub(1),
             Focus::None => None,
         };
@@ -601,13 +608,13 @@ impl View for RepoListScreen {
         }
         // Scroll so the selected row stays visible (rows never wrap).
         let height = usize::from(inner.height).saturating_sub(lines.len()).max(1);
-        let offset = (self.selected + 1).saturating_sub(height);
+        let offset = self.selected.first_visible(height);
         lines.extend(
             rows.iter()
                 .enumerate()
                 .skip(offset)
                 .take(height)
-                .map(|(i, row)| row_line(row, i == self.selected)),
+                .map(|(i, row)| row_line(row, i == self.selected.index())),
         );
 
         let mut paragraph = Paragraph::new(lines);

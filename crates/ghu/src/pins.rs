@@ -18,7 +18,7 @@
 //! (`std::fs::rename` replaces the target on Windows too). The `ghu` directory is created if missing. Default file
 //! permissions (nothing secret is stored). Blocking, but tiny: called on the UI task.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use gh_client::RepoName;
@@ -132,7 +132,7 @@ fn read_file(path: &Path) -> Result<Option<Vec<RepoName>>, PinsError> {
     Ok(Some(pinned))
 }
 
-/// Rewrites the file atomically (tmp file in the same directory, then rename).
+/// Rewrites the file atomically and durably (tmp file in the same directory, written and synced, then renamed).
 fn write_file(path: &Path, list: &[RepoName]) -> Result<(), PinsError> {
     let wrap = |source| PinsError::Write {
         path: path.to_path_buf(),
@@ -144,13 +144,20 @@ fn write_file(path: &Path, list: &[RepoName]) -> Result<(), PinsError> {
         std::fs::create_dir_all(dir).map_err(wrap)?;
     }
     let tmp = path.with_file_name(format!("{FILE_NAME}.tmp"));
-    let result = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, path));
+    let result = write_synced(&tmp, content.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
     if let Err(error) = result {
         // Best effort: the write error is the one worth reporting, a leftover tmp file is harmless.
         let _ = std::fs::remove_file(&tmp);
         return Err(wrap(error));
     }
     Ok(())
+}
+
+/// Creates `path` with `bytes`, flushed to disk before the caller renames it over the real file.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// The Pinned repos, in pin order, and where they are saved. Owned by the Repo list screen (moved from
@@ -246,7 +253,7 @@ impl PinStore {
                 updated.push(name);
                 true
             }
-            Some(index) if updated[index].to_string() == name.to_string() => {
+            Some(index) if updated[index] == name => {
                 // Already pinned under the same spelling: nothing to write.
                 self.check_enabled()?;
                 return Ok(false);

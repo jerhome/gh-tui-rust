@@ -740,7 +740,6 @@ dependencies = [
  "gh-client",
  "gh-fake",
  "ratatui",
- "serde",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

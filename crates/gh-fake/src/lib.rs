@@ -9,6 +9,11 @@
 //!   ([`State::requests`]), authentication (`Authorization: Bearer <State::token>` or `token <…>`, else 401
 //!   `Bad credentials`, or `Requires authentication` without the header), injected [`Failure`]s, then the route.
 //!   An unknown route answers 404 `{"message": "Not Found"}`.
+//! - 422 bodies take both shapes real GitHub sends, and clients must accept both: a route's own validation error
+//!   uses the object form `{"message": "Validation Failed", "errors": [{"resource", "code", "field"}], …}` (entries
+//!   without `message`), an injected [`FailureResponse::Unprocessable`] the string form
+//!   `{"message": m, "errors": [m], …}`. `gh-client` keeps `message` plus the `errors[]` entries that are strings
+//!   or carry a `message`, so the first form reads `Validation Failed` alone.
 //! - Routes (later tickets add routes and `State` fields; existing ones keep their meaning):
 //!   - `GET /user/repos` (#2): query `affiliation` (default all three), `per_page`, `page`; sorted by
 //!     `owner/name` case-insensitively; [`Access::NoAffiliation`] repos never listed.

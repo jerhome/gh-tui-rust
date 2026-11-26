@@ -56,7 +56,13 @@ impl RepoName {
     /// `true` if both name the same GitHub repo: owner and name compared ASCII case-insensitively, as GitHub
     /// does (`Alice/Notes` and `alice/notes` are the same repo). Use it to deduplicate; `==` stays exact.
     pub fn same_repo(&self, other: &RepoName) -> bool {
-        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+        self.repo_key() == other.repo_key()
+    }
+
+    /// The one definition of "same repo": `owner/name` ASCII-lowercased. Two names are [`RepoName::same_repo`]
+    /// exactly when their keys are equal; use it as a deduplication key.
+    pub(crate) fn repo_key(&self) -> String {
+        format!("{}/{}", self.owner, self.name).to_ascii_lowercase()
     }
 }
 
@@ -250,6 +256,31 @@ pub struct PullRequest {
 mod tests {
     use super::{RepoName, Timestamp};
     use crate::Error;
+
+    #[test]
+    fn repo_key_equality_is_same_repo() {
+        let names = [
+            "Alice/Notes",
+            "alice/notes",
+            "alice/notes2",
+            "alic/enotes",
+            "bob/notes",
+            "ALICE/NOTES",
+        ];
+        for a in names {
+            for b in names {
+                let (a, b): (RepoName, RepoName) = (a.parse().unwrap(), b.parse().unwrap());
+                let independent =
+                    a.owner.eq_ignore_ascii_case(&b.owner) && a.name.eq_ignore_ascii_case(&b.name);
+                assert_eq!(a.same_repo(&b), independent, "{a} vs {b}");
+                assert_eq!(a.repo_key() == b.repo_key(), independent, "key {a} vs {b}");
+            }
+        }
+        assert_eq!(
+            "Alice/Notes".parse::<RepoName>().unwrap().repo_key(),
+            "alice/notes"
+        );
+    }
 
     #[test]
     fn timestamp_accepts_the_documented_shape_and_exposes_the_date() {

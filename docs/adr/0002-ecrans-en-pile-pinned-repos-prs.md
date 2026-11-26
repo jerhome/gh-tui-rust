@@ -16,7 +16,12 @@ de contrat : `crates/` (`ghu/src/ui.rs`, `ghu/src/ui/*.rs`, `ghu/src/pins.rs`, `
 1. **Pile d'écrans** (`ghu/src/ui.rs`) : `App.stack: Vec<Box<dyn View>>`, racine = Repo list, jamais dépilée.
    Chaque écran implémente le trait privé `View` (`title`, `help`, `editing`, `key`, `paste`, `apply`,
    `render`) dans son propre module (`ui/repo_list.rs`, `ui/pulls.rs`, puis `ui/pr_detail.rs` en #6…) ; `key`
-   rend un `Flow` (`Ignored`, `Handled`, `Push(écran)`, `Pop`). Un nouvel écran ne modifie pas `ui.rs`.
+   rend un `Flow` (`Ignored`, `Handled`, `Push(écran)`). Le retour à l'écran précédent passe par la table
+   globale (`Esc`), seul chemin de dépilement ; `Flow::Pop`, sans appelant, est retiré (il reviendra avec son
+   premier usage, par exemple un écran qui se ferme après une action). Un écran ouvert en réponse à un résultat
+   d'arrière-plan (`apply`) ou à une touche est demandé par `Shared::push` ; `App` l'empile après le traitement
+   (`apply` comme `key`), dans l'ordre des appels, au-dessus de l'écran qui l'a demandé. `Flow::Push` reste la forme
+   courte pour une touche. Un nouvel écran ne modifie pas `ui.rs`.
 2. **Requêtes de fond routées par identifiant** : `Shared::spawn` rend un `RequestId` unique ; le résultat
    (`Outcome`, une variante par route du client) est offert aux écrans du haut vers le bas, et seul l'écran qui
    attend cet identifiant le prend (`apply` rend `None`). Une réponse périmée (écran quitté, rechargement plus
@@ -36,12 +41,20 @@ de contrat : `crates/` (`ghu/src/ui.rs`, `ghu/src/ui/*.rs`, `ghu/src/pins.rs`, `
 5. **Fichier des Pinned repos** (`ghu/src/pins.rs`) : `<dossier de config de l'OS>/ghu/pinned.toml`, dossier donné
    par `Environment::config_dir` (`dirs::config_dir()` : `$XDG_CONFIG_HOME` ou `~/.config` sous Linux,
    `%APPDATA%` sous Windows, `~/Library/Application Support` sous macOS). Contenu : un commentaire d'en-tête et
-   `pinned = ["owner/name", …]`, noms canoniques de GitHub, dans l'ordre d'épinglage ; rien d'autre. Écriture
+   `pinned = ["owner/name", …]`, dans l'ordre d'épinglage ; rien d'autre. Le fichier ne contient que des noms
+   canoniques (casse rendue par GitHub dans `full_name`) : on épingle le nom rendu par `GET /repos/{owner}/{repo}`,
+   jamais la saisie ; un nom écrit à la main dans une autre casse est remplacé, à sa place dans l'ordre, quand
+   GitHub renvoie le repo au chargement (`pins.pin(repo.name)`, `same_repo` insensible à la casse), et le fichier
+   n'est réécrit que si l'écriture a changé. Un repo renommé ou transféré (autre nom, pas seulement une autre casse)
+   n'est pas rapproché en 0.1 : l'ancien nom reste épinglé. Écriture
    atomique (fichier `.tmp` puis `rename`) à chaque épinglage ou désépinglage, depuis le fil de l'interface (fichier
    minuscule). Lecture : absent = liste vide ; clés inconnues ignorées ; doublons (insensibles à la casse) retirés ;
    fichier illisible, invalide ou de plus de 1 Mio refusé en bloc : liste vide, épinglage désactivé pour la session,
    fichier jamais écrasé, message en notice ; `ghu` démarre quand même. Sans dossier de config : épinglage en
-   mémoire seulement. Les tests utilisent un dossier temporaire (`Harness`), jamais le vrai.
+   mémoire seulement. Les tests utilisent un dossier temporaire (`Harness`), jamais le vrai. **Limite connue de la
+   0.1** : aucun verrou entre deux `ghu` lancés en même temps ; chacun réécrit le fichier entier depuis sa liste en
+   mémoire, donc le dernier qui écrit efface les épinglages faits entre-temps par l'autre (le fichier reste valide
+   grâce au `rename` atomique). Parade si besoin : relire et fusionner avant d'écrire, ou un verrou de fichier.
 6. **Repo list** (#3, #4) : `user_repos(&[])` (les trois affiliations), plus chaque Pinned repo chargé par
    `GET /repos/{owner}/{repo}` (une requête par repo, en parallèle). Pinned repos d'abord, dans l'ordre d'épinglage,
    puis les autres dans l'ordre de GitHub ; un repo n'apparaît qu'une fois (`RepoName::same_repo`). Archived repos
@@ -58,8 +71,18 @@ de contrat : `crates/` (`ghu/src/ui.rs`, `ghu/src/ui/*.rs`, `ghu/src/pins.rs`, `
    chronologique par ordre lexical, `date()` = 10 premiers caractères. Pas de fuseau local en 0.1.
 9. **Dépendances** : `dirs` 7 (MIT OR Apache-2.0 ; dossier de config de l'OS) et `toml` 1.2 (MIT OR Apache-2.0 ;
    fonctionnalités `std`, `serde`, `parse`, `display`) pour `ghu` ; `tempfile` 3 (MIT OR Apache-2.0) en
-   `dev-dependencies` de `ghu`. `thiserror` et `serde`, déjà au workspace, entrent dans `ghu` (`PinsError`,
-   lecture du fichier). Aucune ne demande de chaîne C.
+   `dev-dependencies` de `ghu`. `thiserror`, déjà au workspace, entre dans `ghu` (`PinsError`) ; `serde`
+   n'y entre pas (`pins.rs` lit un `toml::Table`, sans dérive). Aucune ne demande de chaîne C.
+   **Licences transitives** : `dirs` tire `dirs-sys` puis `option-ext` 0.2.0, sous **MPL-2.0** (seul crate du
+   `Cargo.lock` sans option MIT ni Apache). Accepté : copyleft au niveau du fichier, qui n'oblige qu'à publier les
+   fichiers d'`option-ext` modifiés ; on ne le modifie pas et sa source est publique sur crates.io. Option écartée :
+   calculer le dossier de config à la main (`XDG_CONFIG_HOME`, `APPDATA`, `HOME`), trois cas d'OS à maintenir et
+   à tester pour éviter un fichier de 20 lignes. Reviendrait si une distribution binaire demandait une liste de
+   licences sans copyleft (remplacer `dirs` par ce calcul). Le reste du `Cargo.lock` (relevé par
+   `cargo metadata` le 2026-11-26, toutes cibles) est permissif, déjà là avant cette ADR pour l'essentiel (rustls,
+   ratatui et ses dépendances) : ISC, BSD-3-Clause, Zlib, BSL-1.0, Unicode-3.0 / Unicode-DFS-2016,
+   CDLA-Permissive-2.0 (`webpki-root-certs`), WTFPL (`terminfo`), Apache-2.0 WITH LLVM-exception ; `termina`
+   (MIT OR MPL-2.0) et `r-efi` (… OR LGPL-2.1-or-later) sont pris sous leur option MIT.
 10. **Faux serveur** : `Access::NoAffiliation` (repo public d'un autre, servi par `GET /repos/{owner}/{repo}` mais
     jamais listé), `State.pulls: Vec<Pull>` et `PullState` propres à `gh-fake` (JSON écrit d'après la doc GitHub,
     toujours sans dépendre de `gh-client`, ADR 0001) ; pagination commune à toutes les listes ; routes et requêtes

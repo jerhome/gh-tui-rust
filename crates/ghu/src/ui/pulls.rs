@@ -29,6 +29,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::keys::{self, Binding, HelpRow};
+use super::list::{Content, Selection};
 use super::{Flow, Outcome, RequestId, Shared, View, error_message};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -75,22 +76,46 @@ const TABLE: [Binding<Action>; 4] = [
     },
 ];
 
-/// What the list shows.
-enum Content {
-    /// The first answer has not come yet.
-    Loading,
-    /// The PRs of the current filter, in GitHub's order.
-    Loaded(Vec<PullRequest>),
-    /// The request failed: a message for the user.
-    Failed(String),
+/// The words and the switch of each [`PullFilter`], in one place.
+trait FilterExt {
+    /// The other filter (`Tab`).
+    fn toggled(self) -> Self;
+    /// Header title part: `open` or `closed / merged`.
+    fn label(self) -> &'static str;
+    /// Body text when no PR matches.
+    fn empty_text(self) -> &'static str;
+}
+
+impl FilterExt for PullFilter {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Open => Self::Closed,
+            Self::Closed => Self::Open,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed / merged",
+        }
+    }
+
+    fn empty_text(self) -> &'static str {
+        match self {
+            Self::Open => " No open pull requests.",
+            Self::Closed => " No closed or merged pull requests.",
+        }
+    }
 }
 
 /// The PR list screen of one repo.
 pub(crate) struct PullsScreen {
     repo: Repo,
     filter: PullFilter,
-    content: Content,
-    selected: usize,
+    /// The PRs of the current filter, in GitHub's order.
+    content: Content<PullRequest>,
+    selected: Selection,
     /// The latest request; only its answer is applied.
     pending: Option<RequestId>,
 }
@@ -102,7 +127,7 @@ impl PullsScreen {
             repo,
             filter: PullFilter::Open,
             content: Content::Loading,
-            selected: 0,
+            selected: Selection::default(),
             pending: None,
         };
         screen.load(shared);
@@ -119,21 +144,18 @@ impl PullsScreen {
     }
 
     fn count(&self) -> usize {
-        match &self.content {
-            Content::Loaded(pulls) => pulls.len(),
-            _ => 0,
-        }
+        self.content.items().len()
     }
 }
 
 impl View for PullsScreen {
     /// `<owner/name> · Pull requests (open)`, or `(closed / merged)` after `Tab`.
     fn title(&self) -> String {
-        let which = match self.filter {
-            PullFilter::Open => "open",
-            PullFilter::Closed => "closed / merged",
-        };
-        format!("{} · Pull requests ({which})", self.repo.name)
+        format!(
+            "{} · Pull requests ({})",
+            self.repo.name,
+            self.filter.label()
+        )
     }
 
     fn help(&self) -> Vec<HelpRow> {
@@ -147,11 +169,8 @@ impl View for PullsScreen {
         }
         match keys::lookup(&TABLE, key) {
             Some(Action::Toggle) => {
-                self.filter = match self.filter {
-                    PullFilter::Open => PullFilter::Closed,
-                    PullFilter::Closed => PullFilter::Open,
-                };
-                self.selected = 0;
+                self.filter = self.filter.toggled();
+                self.selected.reset();
                 self.load(shared);
                 Flow::Handled
             }
@@ -160,13 +179,11 @@ impl View for PullsScreen {
                 Flow::Handled
             }
             Some(Action::Up) => {
-                self.selected = self.selected.saturating_sub(1);
+                self.selected.up();
                 Flow::Handled
             }
             Some(Action::Down) => {
-                if self.selected + 1 < self.count() {
-                    self.selected += 1;
-                }
+                self.selected.down(self.count());
                 Flow::Handled
             }
             None => Flow::Ignored,
@@ -190,7 +207,7 @@ impl View for PullsScreen {
             Outcome::TaskFailed => Content::Failed(super::TASK_FAILED.to_owned()),
             other => return Some(other),
         };
-        self.selected = self.selected.min(self.count().saturating_sub(1));
+        self.selected.clamp(self.count());
         None
     }
 
@@ -199,19 +216,18 @@ impl View for PullsScreen {
         let height = usize::from(area.height.saturating_sub(2)).max(1);
         let lines: Vec<Line<'_>> = match &self.content {
             Content::Loading => Vec::new(),
-            Content::Loaded(pulls) if pulls.is_empty() => vec![Line::from(match self.filter {
-                PullFilter::Open => " No open pull requests.",
-                PullFilter::Closed => " No closed or merged pull requests.",
-            })],
+            Content::Loaded(pulls) if pulls.is_empty() => {
+                vec![Line::from(self.filter.empty_text())]
+            }
             Content::Loaded(pulls) => pulls
                 .iter()
                 .enumerate()
-                .map(|(i, pull)| pull_line(pull, i == self.selected, width))
+                .map(|(i, pull)| pull_line(pull, i == self.selected.index(), width))
                 .collect(),
             Content::Failed(message) => vec![Line::from(format!(" {message}")).red()],
         };
         // Keep the selected row visible; the rows never wrap, so one PR is one row.
-        let first = (self.selected + 1).saturating_sub(height);
+        let first = self.selected.first_visible(height);
         let scroll = u16::try_from(first).unwrap_or(u16::MAX);
         frame.render_widget(
             Paragraph::new(lines)

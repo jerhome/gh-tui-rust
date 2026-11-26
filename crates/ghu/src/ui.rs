@@ -3,14 +3,17 @@
 //! Layout of `src/ui/` (one module per screen, so screens are built in parallel without touching the same file):
 //!
 //! - `ui.rs` (this file): [`Ui`], the screen stack, key dispatch, background requests ([`Shared`], [`Outcome`],
-//!   [`RequestId`]), user messages for errors ([`error_message`]). Changed only by the `architecte` (a new route
-//!   adds an [`Outcome`] variant; a new screen adds nothing here).
+//!   [`RequestId`], [`Shared::push`] for a screen opened by an answer), user messages for errors
+//!   ([`error_message`]). Changed only by the `architecte` (a new route adds an [`Outcome`] variant; a new screen
+//!   adds nothing here).
 //! - `keys.rs`: key map types and the global table.
 //! - `render.rs`: the frame (header, body of the top screen, footer with loading indicator and notice, help).
+//! - `list.rs`: what the list screens share ([`list::Content`], [`list::Selection`]).
 //! - `repo_list.rs`: the Repo list screen (#2, #3, #4), root of the stack.
 //! - `pulls.rs`: the PR list of one repo (#5).
 
 mod keys;
+mod list;
 mod pulls;
 mod render;
 mod repo_list;
@@ -73,7 +76,6 @@ pub(crate) struct RequestId(u64);
 
 /// The result of a background request. One variant per client route; a new route adds a variant here.
 #[derive(Debug)]
-#[allow(dead_code)] // Skeleton (architecte): `Repo` and `Pulls` are built by dev[tui-repos] and dev[tui-pulls], who remove this.
 pub(crate) enum Outcome {
     /// [`gh_client::Client::user_repos`].
     Repos(gh_client::Result<Vec<Repo>>),
@@ -90,7 +92,6 @@ pub(crate) const TASK_FAILED: &str = "Internal error: a background task failed (
 
 /// A one-line message in the footer, in place of the key hints, until the next key press.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Skeleton (architecte): `Info` is used by dev[tui-repos], who removes this.
 pub(crate) enum Notice {
     /// Neutral information (`Pinned alice/notes.`).
     Info(String),
@@ -106,6 +107,8 @@ pub(crate) struct Shared {
     in_flight: usize,
     next_id: u64,
     pub(crate) notice: Option<Notice>,
+    /// Screens asked for by [`Shared::push`], put on the stack by [`App`] once the current call returns.
+    pushed: Vec<Box<dyn View>>,
 }
 
 impl Shared {
@@ -142,6 +145,12 @@ impl Shared {
         self.notice = Some(notice);
     }
 
+    /// Asks to open `view` on top of the stack. For [`View::apply`], which has no [`Flow`] to return (a key
+    /// returns [`Flow::Push`] instead). Screens pushed in one call go on the stack in order, after the call.
+    pub(crate) fn push(&mut self, view: Box<dyn View>) {
+        self.pushed.push(view);
+    }
+
     /// `true` while at least one background request is in flight.
     pub(crate) fn is_busy(&self) -> bool {
         self.in_flight > 0
@@ -149,7 +158,6 @@ impl Shared {
 }
 
 /// What a screen asks the application to do after a key.
-#[allow(dead_code)] // Skeleton (architecte): `Pop` has no user yet; remove this once a screen returns it.
 pub(crate) enum Flow {
     /// The screen does not use this key: the global table is tried (`?`, `Esc`, `q`).
     Ignored,
@@ -157,8 +165,6 @@ pub(crate) enum Flow {
     Handled,
     /// Open a new screen on top (for example the PR list after `Enter` on a repo).
     Push(Box<dyn View>),
-    /// Close this screen and go back to the previous one (ignored on the root).
-    Pop,
 }
 
 /// A screen of the stack (ADR 0002). Point of variation: one implementation per screen module.
@@ -188,7 +194,8 @@ pub(crate) trait View {
     }
 
     /// Offers a background result. Returns `None` if this screen was waiting for `id` and took it, else gives the
-    /// outcome back (`Some`) so the screen below is offered it. A result nobody claims is dropped (stale).
+    /// outcome back (`Some`) so the screen below is offered it. A result nobody claims is dropped (stale). To open
+    /// a screen in answer, call [`Shared::push`]; it is stacked once the result is dealt with.
     fn apply(&mut self, id: RequestId, outcome: Outcome, shared: &mut Shared) -> Option<Outcome>;
 
     /// Draws the screen's body in `area` (between header and footer). May place the cursor for a text field.
@@ -206,6 +213,7 @@ impl<B: Backend> Ui<B> {
             in_flight: 0,
             next_id: 0,
             notice: None,
+            pushed: Vec::new(),
         };
         let root = repo_list::RepoListScreen::new(&mut shared, ctx.pins, ctx.pins_problem);
         let app = App {
@@ -307,7 +315,6 @@ impl App {
         match flow {
             Flow::Handled => {}
             Flow::Push(view) => self.stack.push(view),
-            Flow::Pop => self.pop(),
             Flow::Ignored if editing => {}
             Flow::Ignored => match keys::lookup(&keys::GLOBAL, key) {
                 Some(keys::Global::Quit) => self.finished = true,
@@ -316,6 +323,8 @@ impl App {
                 None => {}
             },
         }
+        // After the flow, so a screen pushed by `Shared::push` goes on top of one returned as `Flow::Push`.
+        self.stack.append(&mut self.shared.pushed);
     }
 
     /// Goes back one screen; does nothing on the root.
@@ -335,17 +344,24 @@ impl App {
         }
     }
 
-    /// Offers the outcome to the screens, top first, until one claims it.
+    /// Offers the outcome to the screens, top first, until one claims it; then stacks the screens they pushed.
     fn apply(&mut self, id: RequestId, outcome: Outcome) {
         self.shared.in_flight = self.shared.in_flight.saturating_sub(1);
-        let mut outcome = outcome;
+        let mut outcome = Some(outcome);
         for view in self.stack.iter_mut().rev() {
-            match view.apply(id, outcome, &mut self.shared) {
-                None => return,
-                Some(unclaimed) => outcome = unclaimed,
+            match view.apply(
+                id,
+                outcome.take().expect("set until claimed"),
+                &mut self.shared,
+            ) {
+                None => break,
+                Some(unclaimed) => outcome = Some(unclaimed),
             }
         }
-        tracing::debug!(?id, "stale background result dropped");
+        if outcome.is_some() {
+            tracing::debug!(?id, "stale background result dropped");
+        }
+        self.stack.append(&mut self.shared.pushed);
     }
 }
 
@@ -389,4 +405,59 @@ pub(crate) fn error_message(action: &str, error: &gh_client::Error) -> String {
         _ => "an unexpected error occurred (see the log).".to_owned(),
     };
     format!("Cannot {action}: {reason}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::KeyCode;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    /// A screen that asks for another one with [`Shared::push`] when a key is pressed.
+    struct Pusher;
+
+    impl View for Pusher {
+        fn title(&self) -> String {
+            "pusher".to_owned()
+        }
+        fn help(&self) -> Vec<HelpRow> {
+            Vec::new()
+        }
+        fn key(&mut self, _key: KeyEvent, shared: &mut Shared) -> Flow {
+            shared.push(Box::new(Pusher));
+            Flow::Handled
+        }
+        fn apply(&mut self, _: RequestId, outcome: Outcome, _: &mut Shared) -> Option<Outcome> {
+            Some(outcome)
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
+    }
+
+    #[tokio::test]
+    async fn a_screen_pushed_during_a_key_is_stacked_after_the_key() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = gh_client::Client::new(
+            gh_client::ApiBase::default(),
+            gh_client::Token::new("unused").expect("token"),
+        )
+        .expect("client");
+        let mut app = App {
+            shared: Shared {
+                client,
+                tx,
+                in_flight: 0,
+                next_id: 0,
+                notice: None,
+                pushed: Vec::new(),
+            },
+            rx,
+            stack: vec![Box::new(Pusher)],
+            help: false,
+            finished: false,
+            spinner: 0,
+        };
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.stack.len(), 2);
+        assert!(app.shared.pushed.is_empty());
+    }
 }

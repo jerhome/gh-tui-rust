@@ -5,9 +5,7 @@ Une question répondue est déplacée en bas avec sa réponse et sa date.
 
 ## En attente
 
-- **Q1 (2026-11-26) — Langue de l'interface de `ghu`.** Le glossaire est en anglais et dit quels mots éviter « in UI
-  text » ; le repo est public. Changer de langue plus tard coûte la reprise des textes et des tests d'écran.
-  Recommandation : anglais. **Défaut appliqué : anglais** (textes d'écran, aide, messages d'erreur, `--help`).
+Aucune.
 
 ## Répondues
 
@@ -16,3 +14,5 @@ Une question répondue est déplacée en bas avec sa réponse et sa date.
 - 2026-11-26 — Exécutable `ghu`. Repos : les tiens + collaborateur + organisations + saisie libre `owner/repo`.
   Commentaire général d'abord, commentaires de ligne à la version suivante. Diff dans la TUI. Linux/WSL + Windows.
   Plus tard : écran « mes PRs », échelle, fils de discussion.
+- 2026-11-26 16:59 — Q1 : interface en anglais (défaut confirmé). Choix de l'ADR 0002 confirmés : filtre ouvert par `/` ;
+  `o` + `owner/name` épingle toujours le repo ; dates des PRs en AAAA-MM-JJ UTC.

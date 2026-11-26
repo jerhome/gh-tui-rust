@@ -35,3 +35,18 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   rouges** (tdd non suivi) ; un test de dev[client] était faux (passait sans le correctif), trouvé par la
   contre-épreuve de qa. Piste pour la fiche dev : contre-épreuve obligatoire de chaque nouveau test ; pour la fiche
   qa : contre-épreuve systématique des tests des dev.
+- 2026-11-26 17:07 — architecte (opus) — #3/#4/#5 : contrat, squelette, ADR 0002, lots en deux vagues — a marché :
+  signatures et bouchons qui ont permis 3 puis 2 dev en parallèle sans conflit, libellés figés, risques nommés ; ~14
+  min — a manqué : le contrat ne permettait pas d'empiler un écran depuis `apply` (trou trouvé par dev[tui-repos]),
+  licence MPL-2.0 d'une dépendance indirecte (option-ext) non vue, `serde` déclaré inutilement. Piste pour la fiche
+  architecte : relevé des licences de tout l'arbre (`cargo metadata`) quand une dépendance entre.
+- 2026-11-26 17:07 — dev ×5 (sonnet, tui-repos opus) — #3/#4/#5 en worktrees, target commun — a marché : tests vus
+  rouges puis contre-épreuves par mutation (consigne suivie), ÉTAT PARTIEL honnête quand le contrat bloquait — a
+  manqué : deux tests tautologiques ou ne prouvant rien (repo_key, « Tab puis Esc »), trouvés par qa ; dev[tui] a
+  étendu ui.rs (fichier de l'architecte) sur demande, l'ADR a suivi après coup.
+- 2026-11-26 17:07 — qa (sonnet) — #3/#4/#5 — a marché : table critère → test, contre-épreuves, test 403 ajouté, test
+  tautologique corrigé — a manqué : contre-épreuves faites d'abord dans l'arbre partagé pendant une relecture (un
+  relecteur a vu `|| true`) ; ensuite dans un worktree, mais le target commun a donné un faux rouge. Piste pour la
+  fiche qa : mutations dans un worktree avec son propre CARGO_TARGET_DIR.
+- 2026-11-26 17:07 — relecteur ×2 (opus) — #3/#4/#5 — a marché : licence MPL-2.0 trouvée dans Cargo.lock, nom périmé
+  dans un message, fichier non synchronisé, duplications que #6-#10 auraient recopiées — a manqué : rien.

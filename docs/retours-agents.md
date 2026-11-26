@@ -19,3 +19,8 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   cassant le code quand les tests d'intégration étaient verts d'emblée, fixture tirée de l'OpenAPI GitHub, rapport
   précis (vu / non vérifié) ; ~5 min — a manqué : ajouts non demandés (troncature, plafonds, masquage), utiles et
   signalés mais hors demande ; même `cargo fmt --all` sur les fichiers de l'autre dev.
+- 2026-11-26 01:59 — dev (opus) — #2 périmètre tui : ghu, harnais — a marché : 23 tests au harnais, contre-épreuves en cassant
+  le code, 3 passes sans instabilité, essai réel en pseudo-terminal, rapport « vu / non vérifié » précis ; ~7 min —
+  a manqué : **un essai a lancé le vrai `gh` (PATH=/usr/bin:/bin) et lu le vrai jeton** ; arrêt avant toute requête,
+  mais à prévenir (piste pour la fiche dev ou un hook : jamais de `gh` réel ni de jeton réel dans les essais ; PATH
+  sans `gh`, GH_TOKEN factice). Essai en Python (pseudo-terminal) alors que la règle est le maximum en Rust.

@@ -24,11 +24,21 @@ pub struct SystemEnvironment;
 
 impl Environment for SystemEnvironment {
     fn var(&self, name: &str) -> Option<String> {
-        todo!()
+        std::env::var(name).ok()
     }
 
     /// Runs `gh auth token` with stdin closed and waits for it (no timeout: `gh` answers from its local config).
     fn gh_auth_token(&self) -> Option<String> {
-        todo!()
+        let output = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        (!text.trim().is_empty()).then_some(text)
     }
 }

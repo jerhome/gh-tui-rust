@@ -6,11 +6,14 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gh_fake::{FakeGitHub, State};
-use ghu::{Environment, KeyCode, KeyModifiers, Launch, Ui};
+use ghu::{Environment, Input, KeyCode, KeyEvent, KeyModifiers, Launch, Ui};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 /// Screen size of every harness (columns, rows).
@@ -26,29 +29,54 @@ pub struct TestEnv {
     pub vars: HashMap<String, String>,
     /// What `gh auth token` prints (`None`: `gh` missing or not signed in).
     pub gh_auth_token: Option<String>,
+    /// How many times `gh auth token` was run (shared between clones).
+    pub gh_runs: Arc<AtomicUsize>,
 }
 
 impl TestEnv {
     /// `GHU_API_URL` = the fake's URL and `GH_TOKEN` = the fake's accepted token.
     pub fn for_fake(fake: &FakeGitHub) -> Self {
-        todo!()
+        let token = fake.with_state(|s| s.token.clone());
+        let mut env = Self::default();
+        env.set(ghu::API_URL_VAR, &fake.base_url());
+        env.set("GH_TOKEN", &token);
+        env
+    }
+
+    /// Sets a variable.
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.vars.insert(name.to_owned(), value.to_owned());
+    }
+
+    /// Removes a variable.
+    pub fn unset(&mut self, name: &str) {
+        self.vars.remove(name);
     }
 }
 
 impl Environment for TestEnv {
     fn var(&self, name: &str) -> Option<String> {
-        todo!()
+        self.vars.get(name).cloned()
     }
 
     fn gh_auth_token(&self) -> Option<String> {
-        todo!()
+        self.gh_runs.fetch_add(1, Ordering::SeqCst);
+        self.gh_auth_token.clone()
     }
 }
 
 /// Runs `ghu::prepare` with `args` (program name not included) and returns its result with what it wrote on stdout
 /// and stderr.
 pub fn launch(args: &[&str], env: &TestEnv) -> (Launch, String, String) {
-    todo!()
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let argv = std::iter::once("ghu").chain(args.iter().copied());
+    let launch = ghu::prepare(argv, env, &mut out, &mut err);
+    (
+        launch,
+        String::from_utf8(out).expect("stdout is UTF-8"),
+        String::from_utf8(err).expect("stderr is UTF-8"),
+    )
 }
 
 /// Logs captured during a test (all `tracing` events at TRACE level, from every crate, on the current thread).
@@ -57,15 +85,47 @@ pub struct LogCapture {
     _guard: tracing::subscriber::DefaultGuard,
 }
 
+/// A writer appending to the shared buffer of a [`LogCapture`].
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl LogCapture {
     /// Installs the capturing subscriber for the current thread until the value is dropped.
     pub fn start() -> Self {
-        todo!()
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || SharedWriter(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            buffer,
+            _guard: guard,
+        }
     }
 
     /// Everything logged so far.
     pub fn text(&self) -> String {
-        todo!()
+        let bytes = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
@@ -79,52 +139,102 @@ pub struct Harness {
 impl Harness {
     /// Starts the fake with `state`, then the application with [`TestEnv::for_fake`] and no arguments.
     pub async fn start(state: State) -> Self {
-        todo!()
+        Self::start_with(state, |_, _| {}).await
     }
 
     /// Like [`Harness::start`], letting `setup` change the environment first. Panics if `prepare` does not
     /// return `Launch::Tui`.
     pub async fn start_with(state: State, setup: impl FnOnce(&mut TestEnv, &FakeGitHub)) -> Self {
-        todo!()
+        let fake = FakeGitHub::start(state)
+            .await
+            .expect("start the fake server");
+        let mut env = TestEnv::for_fake(&fake);
+        setup(&mut env, &fake);
+        let (launch, _out, err) = launch(&[], &env);
+        let ctx = match launch {
+            Launch::Tui(ctx) => ctx,
+            Launch::Exit(code) => panic!("prepare exited with {code}: {err}"),
+        };
+        let terminal = Terminal::new(TestBackend::new(SIZE.0, SIZE.1)).expect("test terminal");
+        let ui = Ui::new(terminal, ctx);
+        Self { fake, ui }
     }
 
     /// Sends a key press without modifiers.
     pub fn press(&mut self, code: KeyCode) {
-        todo!()
+        self.press_with(code, KeyModifiers::NONE);
     }
 
     /// Sends a key press with modifiers (`Ctrl-C`…).
     pub fn press_with(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        todo!()
+        self.ui.input(Input::Key(KeyEvent::new(code, modifiers)));
     }
 
     /// Sends each character of `text` as a key press.
     pub fn type_text(&mut self, text: &str) {
-        todo!()
+        for c in text.chars() {
+            self.press(KeyCode::Char(c));
+        }
     }
 
     /// Draws, then returns the screen: one line per row, trailing spaces trimmed, joined with `\n`.
     pub fn screen(&mut self) -> String {
-        todo!()
+        self.ui.draw().expect("TestBackend never fails");
+        let buffer = self.ui.terminal().backend().buffer();
+        let area = buffer.area;
+        let mut lines = Vec::with_capacity(usize::from(area.height));
+        for y in area.top()..area.bottom() {
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line.trim_end().to_owned());
+        }
+        lines.join("\n")
     }
 
     /// Applies background results until the screen contains `needle`; panics after [`WAIT`] with the screen.
     pub async fn wait_for(&mut self, needle: &str) {
-        todo!()
+        self.wait_until(&format!("{needle:?} on screen"), |screen| {
+            screen.contains(needle)
+        })
+        .await;
     }
 
     /// Applies background results until `done(screen)` is true; panics after [`WAIT`] with `what` and the screen.
     pub async fn wait_until(&mut self, what: &str, done: impl Fn(&str) -> bool) {
-        todo!()
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let screen = self.screen();
+            if done(&screen) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, self.ui.recv_background())
+                .await
+                .is_err()
+            {
+                let screen = self.screen();
+                panic!("timed out after {WAIT:?} waiting for {what}; screen:\n{screen}");
+            }
+        }
     }
 
     /// Applies background results until no request is in flight; panics after [`WAIT`].
     pub async fn settle(&mut self) {
-        todo!()
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while self.ui.is_busy() {
+            if tokio::time::timeout_at(deadline, self.ui.recv_background())
+                .await
+                .is_err()
+            {
+                let screen = self.screen();
+                panic!("still busy after {WAIT:?}; screen:\n{screen}");
+            }
+        }
     }
 
     /// `true` once the application quit.
     pub fn is_finished(&self) -> bool {
-        todo!()
+        self.ui.is_finished()
     }
 }

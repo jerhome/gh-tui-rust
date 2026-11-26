@@ -118,7 +118,7 @@ where
 
     match gh_client::Client::new(base, token) {
         Ok(client) => {
-            let (pins, pins_problem) = (PinStore::in_memory(), None);
+            let (pins, pins_problem) = PinStore::load(env.config_dir().as_deref());
             Launch::Tui(Context {
                 client,
                 pins,

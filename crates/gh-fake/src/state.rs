@@ -67,7 +67,45 @@ impl State {
         dotfiles.fork = true;
         let mut old = Repo::new("alice", "old-experiments");
         old.archived = true;
-        state.repos = vec![notes, garden, dotfiles, old];
+        let mut shared = Repo::new("bob", "shared-tools");
+        shared.description = Some("Scripts shared with Alice".into());
+        shared.access = Access::Collaborator;
+        let mut widgets = Repo::new("acme", "widgets");
+        widgets.description = Some("Widget toolkit".into());
+        widgets.private = true;
+        widgets.access = Access::OrganizationMember;
+        let mut legacy = Repo::new("acme", "legacy-site");
+        legacy.archived = true;
+        legacy.access = Access::OrganizationMember;
+        let mut public_lib = Repo::new("carol", "public-lib");
+        public_lib.description = Some("A public library of someone else".into());
+        public_lib.access = Access::NoAffiliation;
+        state.repos = vec![
+            notes, garden, dotfiles, old, shared, widgets, legacy, public_lib,
+        ];
+
+        let pr = |number: u64, title: &str, author: &str, pull_state: PullState, day: u32| {
+            let mut p = Pull::new("alice", "notes", number, title, author);
+            p.state = pull_state;
+            p.created_at = format!("2026-02-{day:02}T09:00:00Z");
+            p.updated_at = format!("2026-03-{day:02}T12:30:00Z");
+            p
+        };
+        let mut draft = pr(2, "WIP: full-text search", "carol", PullState::Open, 5);
+        draft.draft = true;
+        draft.head = "search".into();
+        state.pulls = vec![
+            pr(1, "Fix typo in the README", "bob", PullState::Open, 3),
+            draft,
+            pr(
+                3,
+                "Drop the unused export script",
+                "bob",
+                PullState::Closed,
+                8,
+            ),
+            pr(4, "Add a tag index", "carol", PullState::Merged, 10),
+        ];
         state
     }
 }

@@ -3,7 +3,8 @@
 use std::time::{Duration, Instant};
 
 use gh_fake::{
-    Access, DEFAULT_TOKEN, Failure, FailureResponse, FakeGitHub, Method, Repo, State, User,
+    Access, DEFAULT_TOKEN, Failure, FailureResponse, FakeGitHub, Method, Pull, PullState, Repo,
+    State, User,
 };
 use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
@@ -421,7 +422,8 @@ async fn demo_state_serves_repos_with_fork_archived_and_private() {
             .iter()
             .any(|r| r["private"] == true && r["description"].is_string())
     );
-    assert!(repos.iter().all(|r| r["owner"]["login"] == "alice"));
+    // Collaborator and organization repos of other owners are listed too (#3).
+    assert!(repos.iter().any(|r| r["owner"]["login"] != "alice"));
 }
 
 #[tokio::test]
@@ -430,4 +432,532 @@ async fn base_url_is_loopback_without_trailing_slash() {
     assert!(fake.addr().ip().is_loopback());
     assert!(fake.base_url().starts_with("http://127.0.0.1:"));
     assert!(!fake.base_url().ends_with('/'));
+}
+
+// ---- #4 / #5: GET /repos/{owner}/{repo} and GET /repos/{owner}/{repo}/pulls ----
+
+fn pull(repo: &str, number: u64, state: PullState, created: &str, updated: &str) -> Pull {
+    let mut p = Pull::new("alice", repo, number, &format!("PR {number}"), "bob");
+    p.state = state;
+    p.created_at = created.to_owned();
+    p.updated_at = updated.to_owned();
+    p
+}
+
+async fn numbers(resp: Response) -> Vec<u64> {
+    let json: Value = resp.json().await.expect("json");
+    json.as_array()
+        .expect("array")
+        .iter()
+        .map(|p| p["number"].as_u64().expect("number"))
+        .collect()
+}
+
+/// A fake with `alice/notes` and PRs 1 (open), 2 (closed), 3 (merged), 4 (open), plus a PR of another repo.
+async fn with_pulls() -> FakeGitHub {
+    let fake = start(vec![
+        Repo::new("alice", "notes"),
+        Repo::new("alice", "other"),
+    ])
+    .await;
+    fake.with_state(|s| {
+        s.pulls = vec![
+            pull(
+                "notes",
+                1,
+                PullState::Open,
+                "2026-01-01T00:00:00Z",
+                "2026-03-01T00:00:00Z",
+            ),
+            pull(
+                "notes",
+                2,
+                PullState::Closed,
+                "2026-01-02T00:00:00Z",
+                "2026-02-01T00:00:00Z",
+            ),
+            pull(
+                "notes",
+                3,
+                PullState::Merged,
+                "2026-01-03T00:00:00Z",
+                "2026-04-01T00:00:00Z",
+            ),
+            pull(
+                "notes",
+                4,
+                PullState::Open,
+                "2026-01-04T00:00:00Z",
+                "2026-01-15T00:00:00Z",
+            ),
+            pull(
+                "other",
+                9,
+                PullState::Open,
+                "2026-01-09T00:00:00Z",
+                "2026-01-09T00:00:00Z",
+            ),
+        ];
+    });
+    fake
+}
+
+#[tokio::test]
+async fn repo_is_found_with_canonical_name_whatever_the_path_case() {
+    let fake = start(vec![Repo::new("Alice", "Notes")]).await;
+    let resp = get(&fake, "/repos/alice/notes", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["full_name"], "Alice/Notes");
+    assert_eq!(json["name"], "Notes");
+    assert_eq!(json["owner"]["login"], "Alice");
+    let resp = get(&fake, "/repos/ALICE/NOTES", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn no_affiliation_repo_is_served_by_path_but_never_listed() {
+    let mut other = Repo::new("carol", "public-lib");
+    other.access = Access::NoAffiliation;
+    let fake = start(vec![Repo::new("alice", "mine"), other]).await;
+    let resp = get(&fake, "/repos/carol/public-lib", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["full_name"], "carol/public-lib");
+    let listed = get(&fake, "/user/repos", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(full_names(listed).await, ["alice/mine"]);
+    let all = get(
+        &fake,
+        "/user/repos?affiliation=owner,collaborator,organization_member",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(full_names(all).await, ["alice/mine"]);
+}
+
+#[tokio::test]
+async fn unknown_repo_is_404_not_found_on_both_routes() {
+    let fake = start(vec![Repo::new("alice", "notes")]).await;
+    for path in [
+        "/repos/alice/nope",
+        "/repos/alice/nope/pulls",
+        "/repos/zed/notes/pulls",
+    ] {
+        let resp = get(&fake, path, Some(DEFAULT_TOKEN)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let json: Value = resp.json().await.unwrap();
+        assert_eq!(json["message"], "Not Found", "{path}");
+        assert!(json["documentation_url"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn new_routes_require_authentication() {
+    let fake = with_pulls().await;
+    assert_eq!(get(&fake, "/repos/alice/notes", None).await.status(), 401);
+    assert_eq!(
+        get(&fake, "/repos/alice/notes/pulls", Some("bad"))
+            .await
+            .status(),
+        401
+    );
+}
+
+#[tokio::test]
+async fn pulls_default_to_open_only_of_that_repo() {
+    let fake = with_pulls().await;
+    let resp = get(&fake, "/repos/alice/notes/pulls", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // created desc by default: 4 (Jan 4) then 1 (Jan 1).
+    assert_eq!(numbers(resp).await, [4, 1]);
+    let open = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=open",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(numbers(open).await, [4, 1]);
+}
+
+#[tokio::test]
+async fn pulls_state_closed_includes_merged_and_all_includes_everything() {
+    let fake = with_pulls().await;
+    let closed = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=closed",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(numbers(closed).await, [3, 2]);
+    let all = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=all",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(numbers(all).await, [4, 3, 2, 1]);
+}
+
+#[tokio::test]
+async fn pulls_repo_path_is_case_insensitive() {
+    let fake = with_pulls().await;
+    let resp = get(&fake, "/repos/ALICE/Notes/pulls", Some(DEFAULT_TOKEN)).await;
+    assert_eq!(numbers(resp).await, [4, 1]);
+}
+
+#[tokio::test]
+async fn pulls_unknown_state_is_422_validation_failed() {
+    let fake = with_pulls().await;
+    for q in ["state=bogus", "state=", "state=OPEN"] {
+        let resp = get(
+            &fake,
+            &format!("/repos/alice/notes/pulls?{q}"),
+            Some(DEFAULT_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{q}");
+        let json: Value = resp.json().await.unwrap();
+        assert_eq!(json["message"], "Validation Failed", "{q}");
+        assert!(json["documentation_url"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn pulls_sort_by_created_or_updated_asc_or_desc() {
+    let fake = with_pulls().await;
+    let cases = [
+        ("sort=created&direction=desc", vec![4, 3, 2, 1]),
+        ("sort=created&direction=asc", vec![1, 2, 3, 4]),
+        ("sort=updated&direction=desc", vec![3, 1, 2, 4]),
+        ("sort=updated&direction=asc", vec![4, 2, 1, 3]),
+        ("sort=updated", vec![3, 1, 2, 4]),
+        ("direction=asc", vec![1, 2, 3, 4]),
+    ];
+    for (q, expected) in cases {
+        let resp = get(
+            &fake,
+            &format!("/repos/alice/notes/pulls?state=all&{q}"),
+            Some(DEFAULT_TOKEN),
+        )
+        .await;
+        assert_eq!(numbers(resp).await, expected, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn pulls_ties_are_broken_by_number_descending_in_both_directions() {
+    let fake = start(vec![Repo::new("alice", "notes")]).await;
+    fake.with_state(|s| {
+        s.pulls = (1..=3)
+            .map(|n| {
+                pull(
+                    "notes",
+                    n,
+                    PullState::Open,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect();
+    });
+    for dir in ["asc", "desc"] {
+        let resp = get(
+            &fake,
+            &format!("/repos/alice/notes/pulls?direction={dir}"),
+            Some(DEFAULT_TOKEN),
+        )
+        .await;
+        assert_eq!(numbers(resp).await, [3, 2, 1], "{dir}");
+    }
+}
+
+#[tokio::test]
+async fn pulls_are_paginated_with_link_keeping_the_query() {
+    let fake = start(vec![Repo::new("alice", "notes")]).await;
+    fake.with_state(|s| {
+        s.max_per_page = 2;
+        s.pulls = (1..=5)
+            .map(|n| {
+                pull(
+                    "notes",
+                    n,
+                    PullState::Open,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect();
+    });
+    let base = fake.base_url();
+    let p1 = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=all&sort=updated&direction=asc",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    let link = header(&p1, "link");
+    assert_eq!(numbers(p1).await, [5, 4]);
+    assert!(
+        link.contains(&format!("<{base}/repos/alice/notes/pulls?")),
+        "{link}"
+    );
+    assert!(link.contains("state=all"), "{link}");
+    assert!(link.contains("sort=updated"), "{link}");
+    assert!(link.contains("direction=asc"), "{link}");
+    assert!(link.contains("page=2>; rel=\"next\""), "{link}");
+    assert!(link.contains("page=3>; rel=\"last\""), "{link}");
+
+    let p3 = get(
+        &fake,
+        "/repos/alice/notes/pulls?page=3",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert!(p3.headers().get("link").is_none());
+    assert_eq!(numbers(p3).await, [1]);
+    let beyond = get(
+        &fake,
+        "/repos/alice/notes/pulls?page=9",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(beyond.status(), StatusCode::OK);
+    assert!(numbers(beyond).await.is_empty());
+    let one = get(
+        &fake,
+        "/repos/alice/notes/pulls?per_page=1&page=2",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(numbers(one).await, [4]);
+}
+
+#[tokio::test]
+async fn pulls_query_with_control_characters_is_encoded_in_the_link_header() {
+    let fake = start(vec![Repo::new("alice", "notes")]).await;
+    fake.with_state(|s| {
+        s.max_per_page = 1;
+        s.pulls = (1..=2)
+            .map(|n| {
+                pull(
+                    "notes",
+                    n,
+                    PullState::Open,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect();
+    });
+    let resp = get(
+        &fake,
+        "/repos/alice/notes/pulls?sort=created,%0A%C3%A9",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let link = header(&resp, "link");
+    assert!(link.contains("sort=created,%0A%C3%A9"), "{link}");
+    assert!(link.is_ascii() && !link.contains('\n'), "{link:?}");
+}
+
+#[tokio::test]
+async fn pull_json_has_github_shape() {
+    let fake = start(vec![Repo::new("alice", "notes")]).await;
+    fake.with_state(|s| {
+        let mut open = pull(
+            "notes",
+            1,
+            PullState::Open,
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        open.draft = true;
+        open.body = Some("text".into());
+        let mut merged = pull(
+            "notes",
+            2,
+            PullState::Merged,
+            "2026-01-03T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        );
+        merged.author = None;
+        merged.head = "fix".into();
+        let closed = pull(
+            "notes",
+            3,
+            PullState::Closed,
+            "2026-01-05T00:00:00Z",
+            "2026-01-06T00:00:00Z",
+        );
+        s.pulls = vec![open, merged, closed];
+    });
+    let resp = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=all&direction=asc",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    let json: Value = resp.json().await.unwrap();
+    let (open, merged, closed) = (&json[0], &json[1], &json[2]);
+
+    assert_eq!(open["number"], 1);
+    assert_eq!(open["state"], "open");
+    assert_eq!(open["title"], "PR 1");
+    assert_eq!(open["draft"], true);
+    assert_eq!(open["body"], "text");
+    assert_eq!(open["user"]["login"], "bob");
+    assert_eq!(open["user"]["type"], "User");
+    assert!(open["user"]["id"].is_u64());
+    assert!(open["id"].is_u64());
+    assert_eq!(open["created_at"], "2026-01-01T00:00:00Z");
+    assert_eq!(open["updated_at"], "2026-01-02T00:00:00Z");
+    assert_eq!(open["closed_at"], Value::Null);
+    assert_eq!(open["merged_at"], Value::Null);
+    assert_eq!(open["head"]["ref"], "feature");
+    assert_eq!(open["head"]["label"], "alice:feature");
+    assert_eq!(open["base"]["ref"], "main");
+    assert_eq!(open["base"]["label"], "alice:main");
+    assert_eq!(open["html_url"], "https://github.com/alice/notes/pull/1");
+
+    assert_eq!(merged["state"], "closed");
+    assert_eq!(merged["user"], Value::Null);
+    assert_eq!(merged["draft"], false);
+    assert_eq!(merged["body"], Value::Null);
+    assert_eq!(merged["merged_at"], "2026-01-04T00:00:00Z");
+    assert_eq!(merged["closed_at"], "2026-01-04T00:00:00Z");
+    assert_eq!(merged["head"]["ref"], "fix");
+
+    assert_eq!(closed["state"], "closed");
+    assert_eq!(closed["merged_at"], Value::Null);
+    assert_eq!(closed["closed_at"], "2026-01-06T00:00:00Z");
+}
+
+#[tokio::test]
+async fn injected_failures_apply_to_the_new_paths() {
+    let fake = with_pulls().await;
+    for path in ["/repos/alice/notes", "/repos/alice/notes/pulls"] {
+        fake.with_state(|s| {
+            s.failures = vec![Failure {
+                method: Method::Get,
+                path: path.into(),
+                response: FailureResponse::ServerError,
+                remaining: Some(1),
+            }]
+        });
+        assert_eq!(
+            get(&fake, path, Some(DEFAULT_TOKEN)).await.status(),
+            500,
+            "{path}"
+        );
+        assert_eq!(
+            get(&fake, path, Some(DEFAULT_TOKEN)).await.status(),
+            200,
+            "{path}"
+        );
+    }
+    // A failure on one path leaves the other alone.
+    fake.with_state(|s| {
+        s.failures = vec![Failure {
+            method: Method::Get,
+            path: "/repos/alice/notes/pulls".into(),
+            response: FailureResponse::RateLimited,
+            remaining: None,
+        }]
+    });
+    assert_eq!(
+        get(&fake, "/repos/alice/notes", Some(DEFAULT_TOKEN))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        get(&fake, "/repos/alice/notes/pulls", Some(DEFAULT_TOKEN))
+            .await
+            .status(),
+        403
+    );
+}
+
+#[tokio::test]
+async fn demo_state_has_the_data_the_later_tickets_need() {
+    let fake = FakeGitHub::start(State::demo()).await.unwrap();
+    let (collab, org, none) = fake.with_state(|s| {
+        let count = |a: Access| {
+            s.repos
+                .iter()
+                .filter(|r| r.access == a && r.owner != "alice")
+                .count()
+        };
+        (
+            count(Access::Collaborator),
+            s.repos
+                .iter()
+                .filter(|r| r.access == Access::OrganizationMember)
+                .collect::<Vec<_>>()
+                .len(),
+            count(Access::NoAffiliation),
+        )
+    });
+    assert!(
+        collab >= 1 && org >= 2 && none >= 1,
+        "{collab} {org} {none}"
+    );
+    let org_archived = fake.with_state(|s| {
+        s.repos
+            .iter()
+            .any(|r| r.access == Access::OrganizationMember && r.archived)
+    });
+    assert!(org_archived);
+    let org_owner = fake.with_state(|s| {
+        let owners: std::collections::HashSet<_> = s
+            .repos
+            .iter()
+            .filter(|r| r.access == Access::OrganizationMember)
+            .map(|r| r.owner.clone())
+            .collect();
+        owners.len()
+    });
+    assert_eq!(
+        org_owner, 1,
+        "both organization repos belong to one organization"
+    );
+
+    // The no-affiliation repo opens by path but is not listed.
+    let path = fake.with_state(|s| {
+        let r = s
+            .repos
+            .iter()
+            .find(|r| r.access == Access::NoAffiliation)
+            .unwrap();
+        format!("/repos/{}/{}", r.owner, r.name)
+    });
+    assert_eq!(get(&fake, &path, Some(DEFAULT_TOKEN)).await.status(), 200);
+
+    let all = get(
+        &fake,
+        "/repos/alice/notes/pulls?state=all&per_page=100",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    let json: Value = all.json().await.unwrap();
+    let prs = json.as_array().unwrap();
+    let open: Vec<_> = prs.iter().filter(|p| p["state"] == "open").collect();
+    assert!(open.len() >= 2);
+    assert!(open.iter().any(|p| p["draft"] == true));
+    assert!(
+        prs.iter()
+            .any(|p| p["state"] == "closed" && p["merged_at"].is_null())
+    );
+    assert!(prs.iter().any(|p| !p["merged_at"].is_null()));
+    let updated: std::collections::HashSet<_> = prs
+        .iter()
+        .map(|p| p["updated_at"].as_str().unwrap())
+        .collect();
+    assert_eq!(updated.len(), prs.len(), "distinct updated_at");
+    let authors: std::collections::HashSet<_> = prs
+        .iter()
+        .filter_map(|p| p["user"]["login"].as_str())
+        .collect();
+    assert!(authors.len() >= 2);
 }

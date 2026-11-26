@@ -44,7 +44,7 @@ pub fn pinned_repos_path(config_dir: &Path) -> PathBuf {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PinsError {
     /// The file exists but cannot be read (permissions, I/O).
-    #[error("Cannot read the pinned repos file {}: {source}. Pinning is disabled.", path.display())]
+    #[error("Cannot read the pinned repos file ({source}). Pinning is disabled. File: {}", path.display())]
     Read {
         /// The file.
         path: PathBuf,
@@ -52,7 +52,7 @@ pub(crate) enum PinsError {
         source: std::io::Error,
     },
     /// The file is not a valid Pinned repos file (see the module documentation).
-    #[error("The pinned repos file {} is invalid ({reason}). Pinning is disabled; fix or delete the file.", path.display())]
+    #[error("The pinned repos file is invalid ({reason}). Pinning is disabled; fix or delete the file: {}", path.display())]
     Invalid {
         /// The file.
         path: PathBuf,
@@ -60,7 +60,7 @@ pub(crate) enum PinsError {
         reason: String,
     },
     /// Saving failed (directory creation, write or rename). The store is unchanged.
-    #[error("Cannot save the pinned repos file {}: {source}", path.display())]
+    #[error("Cannot save the pinned repos file ({source}). File: {}", path.display())]
     Write {
         /// The file.
         path: PathBuf,

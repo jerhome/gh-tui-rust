@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-26 16:59.
+Mis à jour le 2026-11-26 17:12.
 
 ## État
 
@@ -14,14 +14,14 @@ Mis à jour le 2026-11-26 16:59.
 
 ## Prochaine action
 
-Ticket #11 fermé (CI verte, ba6b1c9). #3, #4, #5 : vagues 1 et 2 fusionnées sur main local (6161121, 11 commits
-non poussés) + correctif non commité (Shared::push, allows Skeleton retirés). Q1 et choix de l'ADR 0002 confirmés.
+Tickets #3, #4, #5 fermés (3e7c5f9, poussé). **CI rouge sur macOS** : test
+`an_invalid_file_at_start_up_shows_a_notice_and_refuses_pinning` (pinned_repos.rs:354), écran sans « is invalid » ;
+hypothèse : chemin temporaire macOS long qui pousse le texte hors des 100 colonnes du harnais (test fragile).
 
-1. En cours : qa + relecteur ×2 (Standards, Spec) sur `git diff ba6b1c9`.
-2. Corrections ; architecte : phrase Shared::push dans l'ADR 0002, sort de `Flow::Pop` (inutilisé), format du 422
-   de gh-fake.
-3. Commit `Closes #3 #4 #5` → push → CI.
-4. Ensuite : architecte pour le contrat de #6 à #10.
+1. Corriger ce test (dev[tui] ou qa), CI verte.
+2. ADR 0003 (#6 à #10) écrite, statut « proposée » : relecture (relecteur), acceptation, puis vague 0 (architecte),
+   dev[fake] + dev[client], dev[tui-detail], etc. (ordre dans l'ADR).
+3. Rétro n° 3 d'agents-home le 2026-11-26 vers 17:20 (questionnaire : <https://claude.ai/artifact/T3kijTUKyZ8wNZfNckNzHA>).
 
 ## Points ouverts
 

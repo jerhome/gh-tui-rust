@@ -1,6 +1,7 @@
 //! The HTTP client.
 
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use url::Url;
 
 use crate::link::next_link;
 use crate::status::{classify, redact};
-use crate::wire::decode_repos;
+use crate::wire::{decode_pulls, decode_repo, decode_repos};
 use crate::{Affiliation, ApiBase, Error, PullFilter, PullRequest, Repo, RepoName, Result, Token};
 
 /// Largest body read from one answer: a page of 100 repos is far below it; the limit only bounds memory.
@@ -114,30 +115,14 @@ impl Client {
             .append_pair("affiliation", &affiliation_list(affiliations))
             .append_pair("per_page", "100");
 
-        let mut repos = Vec::new();
-        let mut seen = HashSet::new();
-        let mut total_bytes = 0usize;
-        loop {
-            if !seen.insert(url.clone()) || seen.len() > MAX_PAGES {
-                return Err(
-                    self.unexpected("the pagination does not end (repeated or too many pages)")
-                );
-            }
-            let (headers, body) = self.get(url.clone(), body_limit(total_bytes)).await?;
-            total_bytes += body.len();
-            repos.extend(
-                decode_repos(&body, self.token.expose())
-                    .map_err(|e| redact(e, self.token.expose()))?,
-            );
-            let Some(next) = headers
-                .get(LINK)
-                .and_then(|v| v.to_str().ok())
-                .and_then(next_link)
-            else {
-                return Ok(repos);
-            };
-            url = self.next_page_url(&url, next)?;
-        }
+        let secret = self.token.expose();
+        self.paginate(
+            url,
+            |body| decode_repos(body, secret),
+            // GitHub compares names ASCII case-insensitively (RepoName::same_repo).
+            |repo| repo.name.to_string().to_ascii_lowercase(),
+        )
+        .await
     }
 
     /// `GET /repos/{owner}/{repo}`: one repo by name (glossary: Pinned repo; opening `owner/name`, #4).
@@ -150,7 +135,9 @@ impl Client {
     /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`], [`crate::Error::Api`]. A redirect (3xx, GitHub's
     /// answer for a renamed repo) is not followed and is an [`crate::Error::Api`] with its status.
     pub async fn repo(&self, name: &RepoName) -> Result<Repo> {
-        todo!("dev[client]: GET /repos/{name}")
+        let url = self.route(&format!("/repos/{}/{}", name.owner(), name.name()))?;
+        let (_, body) = self.get(url, MAX_BODY_BYTES).await?;
+        decode_repo(&body, self.token.expose()).map_err(|e| redact(e, self.token.expose()))
     }
 
     /// `GET /repos/{owner}/{repo}/pulls?state=open|closed&sort=updated&direction=desc&per_page=100`, following
@@ -161,7 +148,56 @@ impl Client {
     ///
     /// Errors: as [`Client::user_repos`], plus [`crate::Error::NotFound`] when the repo is missing or invisible.
     pub async fn pulls(&self, repo: &RepoName, filter: PullFilter) -> Result<Vec<PullRequest>> {
-        todo!("dev[client]: GET /repos/{repo}/pulls for {filter:?}")
+        let mut url = self.route(&format!("/repos/{}/{}/pulls", repo.owner(), repo.name()))?;
+        url.query_pairs_mut()
+            .append_pair(
+                "state",
+                match filter {
+                    PullFilter::Open => "open",
+                    PullFilter::Closed => "closed",
+                },
+            )
+            .append_pair("sort", "updated")
+            .append_pair("direction", "desc")
+            .append_pair("per_page", "100");
+
+        let secret = self.token.expose();
+        self.paginate(url, |body| decode_pulls(body, secret), |pull| pull.number)
+            .await
+    }
+
+    /// Reads a list route page after page, following `next` links, and keeps the first of the items that share a
+    /// `key` (pagination drift can show one twice). `decode` turns one page body into items.
+    async fn paginate<T, K: Hash + Eq>(
+        &self,
+        first: Url,
+        decode: impl Fn(&[u8]) -> Result<Vec<T>>,
+        key: impl Fn(&T) -> K,
+    ) -> Result<Vec<T>> {
+        let mut url = first;
+        let mut items = Vec::new();
+        let mut keys = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut total_bytes = 0usize;
+        loop {
+            if !seen.insert(url.clone()) || seen.len() > MAX_PAGES {
+                return Err(
+                    self.unexpected("the pagination does not end (repeated or too many pages)")
+                );
+            }
+            let (headers, body) = self.get(url.clone(), body_limit(total_bytes)).await?;
+            total_bytes += body.len();
+            let page = decode(&body).map_err(|e| redact(e, self.token.expose()))?;
+            items.extend(page.into_iter().filter(|item| keys.insert(key(item))));
+            let Some(next) = headers
+                .get(LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link)
+            else {
+                return Ok(items);
+            };
+            url = self.next_page_url(&url, next)?;
+        }
     }
 
     /// `{base}{path}`.

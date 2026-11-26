@@ -57,6 +57,27 @@ The five default labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready
 
 Single-context: `GLOSSARY.md` at the root (English) and `docs/adr/`. See `docs/agents/domain.md`.
 
+## Skills mattpocock et agents de base combinés
+
+Les skills mattpocock donnent la méthode, les agents d'agents-home font le travail. Les agents n'ont pas l'outil
+`Skill` : la consigne leur donne le chemin du `SKILL.md` à lire et suivre (plugin `mattpocock-skills`, dossier
+`skills/engineering/`).
+
+- **`implement` (un ticket)** : `architecte` si le ticket pose des crates ou des interfaces publiques → `dev` (un
+  périmètre) qui suit le skill `tdd` au point de test de la spec → `qa` (vérification complète) → skill
+  `code-review` dont les deux relectures (Standards, Spec) sont confiées à `relecteur` → corrections par la boucle
+  d'échec (CONVENTIONS.md § 6) → commit par la session principale, qui ferme le ticket (`Closes #N`).
+- **`implement-spec` (plusieurs tickets)** : les « implementer subagents » sont des `dev`, chacun dans son worktree ;
+  ils ne commitent pas (règle d'agents-home) : la session principale commite leur travail et le fusionne dans la
+  branche d'intégration.
+- **Point de test** : un seul, l'application pilotée au clavier (écran lu dans le backend de test de ratatui) contre
+  le faux serveur GitHub (spec #1).
+
+## Commits
+
+Accord permanent de l'utilisateur (2026-11-26) : la session principale commite sans demander, après la vérification
+complète. Les sous-agents ne commitent jamais. Push par lots (agents-home, règles communes).
+
 ## Vérification (« terminé »)
 
 ```bash

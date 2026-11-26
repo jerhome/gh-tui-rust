@@ -7,14 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Query, Request, State as AxState};
+use axum::extract::{Path, Query, Request, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
 
-use crate::state::{Access, Failure, FailureResponse, Method, RecordedRequest, Repo, State};
+use crate::state::{
+    Access, Failure, FailureResponse, Method, Pull, PullState, RecordedRequest, Repo, State,
+};
 
 const DOC_URL: &str = "https://docs.github.com/rest";
 const RATE_LIMIT: u32 = 5000;
@@ -37,6 +39,8 @@ pub(crate) fn router(state: Arc<Mutex<State>>, addr: SocketAddr) -> Router {
     let app = App { state, addr };
     Router::new()
         .route("/user/repos", get(user_repos))
+        .route("/repos/{owner}/{repo}", get(repo))
+        .route("/repos/{owner}/{repo}/pulls", get(pulls))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), pipeline))
         .with_state(app)
@@ -75,7 +79,11 @@ fn message(status: StatusCode, remaining: u32, text: &str) -> Response {
 }
 
 async fn not_found() -> Response {
-    message(StatusCode::NOT_FOUND, RATE_LIMIT - 1, "Not Found")
+    not_found_with(RATE_LIMIT - 1)
+}
+
+fn not_found_with(remaining: u32) -> Response {
+    message(StatusCode::NOT_FOUND, remaining, "Not Found")
 }
 
 /// What the `Authorization` header carries.
@@ -244,14 +252,6 @@ fn access_matches(access: Access, affiliation: &str) -> bool {
     affiliation.split(',').any(|a| a.trim() == wanted)
 }
 
-/// Pagination facts needed to build the `Link` header once the state lock is released.
-struct Page {
-    per_page: usize,
-    page: usize,
-    last: usize,
-    affiliation: Option<String>,
-}
-
 /// Percent-encodes everything but URL-unreserved characters, so any decoded query value is header-safe.
 fn percent_encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -265,65 +265,45 @@ fn percent_encode(raw: &str) -> String {
     out
 }
 
-async fn user_repos(
-    AxState(app): AxState<App>,
-    Query(query): Query<HashMap<String, String>>,
+/// Positive integer query parameter, if present and valid.
+fn positive(query: &HashMap<String, String>, name: &str) -> Option<usize> {
+    query
+        .get(name)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Serves the requested page of `items` (already filtered and sorted) as a JSON array, with the `Link` header
+/// while a next page exists. `path` is the route path; the other query parameters are kept in the links.
+fn paginated(
+    app: &App,
+    path: &str,
+    query: &HashMap<String, String>,
+    items: &[Value],
+    max_per_page: usize,
 ) -> Response {
-    let (body, paging) = {
-        let state = app.lock();
-        let affiliation = query
-            .get("affiliation")
-            .map_or("owner,collaborator,organization_member", String::as_str);
-        let mut repos: Vec<&Repo> = state
-            .repos
-            .iter()
-            .filter(|r| access_matches(r.access, affiliation))
-            .collect();
-        repos.sort_by_key(|r| (r.owner.to_lowercase(), r.name.to_lowercase()));
-        let max = state.max_per_page.max(1);
-        let per_page = query
-            .get("per_page")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_PER_PAGE)
-            .min(max);
-        let page = query
-            .get("page")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(1);
-        let last = repos.len().div_ceil(per_page).max(1);
-        let start = (page - 1).saturating_mul(per_page).min(repos.len());
-        let end = start.saturating_add(per_page).min(repos.len());
-        let items: Vec<Value> = repos[start..end]
-            .iter()
-            .map(|r| repo_json(r, &state))
-            .collect();
-        (
-            items,
-            Page {
-                per_page,
-                page,
-                last,
-                affiliation: query.get("affiliation").cloned(),
-            },
-        )
-    };
-    let Page {
-        per_page,
-        page,
-        last,
-        affiliation,
-    } = paging;
+    let per_page = positive(query, "per_page")
+        .unwrap_or(DEFAULT_PER_PAGE)
+        .min(max_per_page.max(1));
+    let page = positive(query, "page").unwrap_or(1);
+    let last = items.len().div_ceil(per_page).max(1);
+    let start = (page - 1).saturating_mul(per_page).min(items.len());
+    let end = start.saturating_add(per_page).min(items.len());
+
+    let mut kept: Vec<(&String, &String)> = query
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "per_page" | "page"))
+        .collect();
+    kept.sort();
     let url = |p: usize| {
-        let mut u = format!("http://{}/user/repos?", app.addr);
-        if let Some(a) = &affiliation {
-            u.push_str(&format!("affiliation={}&", percent_encode(a)));
+        let mut u = format!("http://{}{path}?", app.addr);
+        for (k, v) in &kept {
+            u.push_str(&format!("{}={}&", percent_encode(k), percent_encode(v)));
         }
         u.push_str(&format!("per_page={per_page}&page={p}"));
         u
     };
-    let mut resp = axum::Json(body).into_response();
+    let mut resp = axum::Json(&items[start..end]).into_response();
     if page < last {
         let link = format!(
             "<{}>; rel=\"next\", <{}>; rel=\"last\"",
@@ -336,4 +316,134 @@ async fn user_repos(
         );
     }
     resp
+}
+
+async fn user_repos(
+    AxState(app): AxState<App>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let (items, max) = {
+        let state = app.lock();
+        let affiliation = query
+            .get("affiliation")
+            .map_or("owner,collaborator,organization_member", String::as_str);
+        let mut repos: Vec<&Repo> = state
+            .repos
+            .iter()
+            .filter(|r| access_matches(r.access, affiliation))
+            .collect();
+        repos.sort_by_key(|r| (r.owner.to_lowercase(), r.name.to_lowercase()));
+        let items: Vec<Value> = repos.iter().map(|r| repo_json(r, &state)).collect();
+        (items, state.max_per_page)
+    };
+    paginated(&app, "/user/repos", &query, &items, max)
+}
+
+/// The repo of `state.repos` whose owner and name match case-insensitively.
+fn find_repo<'a>(state: &'a State, owner: &str, name: &str) -> Option<&'a Repo> {
+    state
+        .repos
+        .iter()
+        .find(|r| r.owner.eq_ignore_ascii_case(owner) && r.name.eq_ignore_ascii_case(name))
+}
+
+async fn repo(AxState(app): AxState<App>, Path((owner, name)): Path<(String, String)>) -> Response {
+    let state = app.lock();
+    match find_repo(&state, &owner, &name) {
+        Some(r) => axum::Json(repo_json(r, &state)).into_response(),
+        None => not_found_with(RATE_LIMIT - 1),
+    }
+}
+
+fn user_json(login: &str, state: &State) -> Value {
+    let id = if login == state.user.login {
+        state.user.id
+    } else {
+        fake_id(login)
+    };
+    json!({ "login": login, "id": id, "type": "User" })
+}
+
+fn pull_json(pull: &Pull, repo: &Repo, state: &State) -> Value {
+    let full_name = format!("{}/{}", repo.owner, repo.name);
+    let closed_at = match pull.state {
+        PullState::Open => Value::Null,
+        PullState::Closed | PullState::Merged => json!(pull.updated_at),
+    };
+    let merged_at = match pull.state {
+        PullState::Merged => json!(pull.updated_at),
+        PullState::Open | PullState::Closed => Value::Null,
+    };
+    json!({
+        "id": fake_id(&format!("{full_name}#{}", pull.number)),
+        "number": pull.number,
+        "state": if pull.state == PullState::Open { "open" } else { "closed" },
+        "title": pull.title,
+        "user": pull.author.as_deref().map_or(Value::Null, |a| user_json(a, state)),
+        "body": pull.body,
+        "draft": pull.draft,
+        "created_at": pull.created_at,
+        "updated_at": pull.updated_at,
+        "closed_at": closed_at,
+        "merged_at": merged_at,
+        "head": { "ref": pull.head, "label": format!("{}:{}", repo.owner, pull.head) },
+        "base": { "ref": pull.base, "label": format!("{}:{}", repo.owner, pull.base) },
+        "html_url": format!("https://github.com/{full_name}/pull/{}", pull.number),
+    })
+}
+
+async fn pulls(
+    AxState(app): AxState<App>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let (items, max) = {
+        let state = app.lock();
+        let Some(repo) = find_repo(&state, &owner, &name) else {
+            return not_found_with(RATE_LIMIT - 1);
+        };
+        let wanted = query.get("state").map_or("open", String::as_str);
+        if !matches!(wanted, "open" | "closed" | "all") {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                RATE_LIMIT - 1,
+                json!({
+                    "message": "Validation Failed",
+                    "errors": [{
+                        "resource": "Issue",
+                        "code": "invalid",
+                        "field": "state",
+                    }],
+                    "documentation_url": DOC_URL,
+                }),
+            );
+        }
+        let mut found: Vec<&Pull> = state
+            .pulls
+            .iter()
+            .filter(|p| {
+                p.owner.eq_ignore_ascii_case(&repo.owner) && p.repo.eq_ignore_ascii_case(&repo.name)
+            })
+            .filter(|p| match wanted {
+                "open" => p.state == PullState::Open,
+                "closed" => p.state != PullState::Open,
+                _ => true,
+            })
+            .collect();
+        let by_updated = query.get("sort").is_some_and(|s| s == "updated");
+        let ascending = query.get("direction").is_some_and(|d| d == "asc");
+        found.sort_by(|a, b| {
+            let (ka, kb) = if by_updated {
+                (&a.updated_at, &b.updated_at)
+            } else {
+                (&a.created_at, &b.created_at)
+            };
+            let order = if ascending { ka.cmp(kb) } else { kb.cmp(ka) };
+            order.then(b.number.cmp(&a.number))
+        });
+        let items: Vec<Value> = found.iter().map(|p| pull_json(p, repo, &state)).collect();
+        (items, state.max_per_page)
+    };
+    let path = format!("/repos/{owner}/{name}/pulls");
+    paginated(&app, &path, &query, &items, max)
 }

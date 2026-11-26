@@ -18,9 +18,6 @@
 //! (`std::fs::rename` replaces the target on Windows too). The `ghu` directory is created if missing. Default file
 //! permissions (nothing secret is stored). Blocking, but tiny: called on the UI task.
 
-// Skeleton (architecte): the store is wired by dev[pins] (load) and dev[tui-repos] (pin, unpin), who remove this.
-#![allow(dead_code)]
-
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -295,7 +292,8 @@ impl PinStore {
         }
     }
 
-    /// The file changes are saved to; `None` in memory or disabled mode.
+    /// The file changes are saved to; `None` in memory or disabled mode. Only the unit tests need it.
+    #[cfg(test)]
     pub(crate) fn path(&self) -> Option<&Path> {
         match &self.mode {
             Mode::Saved(path) => Some(path),

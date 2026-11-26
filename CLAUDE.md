@@ -75,8 +75,9 @@ Les skills mattpocock donnent la méthode, les agents d'agents-home font le trav
 
 ## Commits
 
-Accord permanent de l'utilisateur (2026-11-26) : la session principale commite sans demander, après la vérification
-complète. Les sous-agents ne commitent jamais. Push par lots (agents-home, règles communes).
+Accord permanent de l'utilisateur (2026-11-26) : la session principale commite et pousse sans demander, après la
+vérification complète. Les sous-agents ne commitent jamais. Push par lots (agents-home, règles communes). Compte
+`jerhome` pour le push, jamais le compte actif par défaut de `gh`.
 
 ## Vérification (« terminé »)
 

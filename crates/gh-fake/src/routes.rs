@@ -239,6 +239,7 @@ fn access_matches(access: Access, affiliation: &str) -> bool {
         Access::Owner => "owner",
         Access::Collaborator => "collaborator",
         Access::OrganizationMember => "organization_member",
+        Access::NoAffiliation => return false,
     };
     affiliation.split(',').any(|a| a.trim() == wanted)
 }

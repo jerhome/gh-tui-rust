@@ -8,8 +8,9 @@
 //! - The token is only ever written into the `Authorization` header. It never appears in `Debug` output,
 //!   error messages or logs ([`Token`] has a masked `Debug` and no `Display`).
 //! - No GraphQL in 0.1. Wire (JSON) types are private; the public model types in this crate are what callers see.
-//! - Later tickets add methods (repo by name, pull requests, files, reviews, comments, publishing) on [`Client`]
-//!   following the same shape, and variants on the `#[non_exhaustive]` types.
+//! - Routes: `GET /user/repos` (#2, #3), `GET /repos/{owner}/{repo}` (#4), `GET /repos/{owner}/{repo}/pulls` (#5).
+//!   Later tickets add methods (one PR, files, reviews, comments, publishing) on [`Client`] following the same
+//!   shape, and variants on the `#[non_exhaustive]` types.
 
 mod base;
 mod client;
@@ -23,7 +24,9 @@ mod wire;
 pub use base::ApiBase;
 pub use client::Client;
 pub use error::Error;
-pub use model::{Affiliation, Repo, RepoName};
+pub use model::{
+    Affiliation, PrNumber, PrState, PullFilter, PullRequest, Repo, RepoName, Timestamp,
+};
 pub use token::Token;
 
 /// Result type of this crate.

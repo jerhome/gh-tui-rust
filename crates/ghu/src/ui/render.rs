@@ -1,19 +1,19 @@
-//! Drawing the application state.
+//! Drawing the frame: header, the top screen's body, footer, key help.
 
-use gh_client::Repo;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
-use super::keys::BINDINGS;
-use super::{App, RepoList};
+use super::keys::{GLOBAL, HelpRow, help_rows};
+use super::{App, Notice};
 
 /// Spinner frames shown before `Loading`.
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
-/// Draws the whole screen.
+/// Draws the whole screen: header ` ghu · <title of the top screen>`, the top screen's body, then the footer: the
+/// notice if any (red for an error), else `<spinner> Loading…` while busy, followed by `? help · q quit`.
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -22,42 +22,36 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     ])
     .areas(frame.area());
 
-    frame.render_widget(Line::from(" ghu · Repo list").bold(), header);
+    let top = app.top();
+    frame.render_widget(Line::from(format!(" ghu · {}", top.title())).bold(), header);
+    top.render(frame, body);
 
-    let lines: Vec<Line<'_>> = match &app.repos {
-        RepoList::Loading => Vec::new(),
-        RepoList::Loaded(repos) if repos.is_empty() => vec![Line::from(" No repos.")],
-        RepoList::Loaded(repos) => repos.iter().map(repo_line).collect(),
-        RepoList::Failed(message) => vec![Line::from(format!(" {message}")).red()],
+    let line = match &app.shared.notice {
+        Some(Notice::Info(text)) => Line::from(format!(" {text}")),
+        Some(Notice::Error(text)) => Line::from(format!(" {text}")).red(),
+        None if app.shared.is_busy() => {
+            let spin = SPINNER[app.spinner % SPINNER.len()];
+            Line::from(format!(" {spin} Loading…   ? help · q quit"))
+        }
+        None => Line::from(" ? help · q quit"),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered())
-            .wrap(Wrap { trim: false }),
-        body,
-    );
-
-    let status = if app.is_busy() {
-        let spin = SPINNER[app.spinner % SPINNER.len()];
-        format!(" {spin} Loading…   ? help · q quit")
-    } else {
-        " ? help · q quit".to_owned()
-    };
-    frame.render_widget(Line::from(status), footer);
+    frame.render_widget(line, footer);
 
     if app.help {
-        draw_help(frame, body);
+        let mut rows = top.help();
+        rows.extend(help_rows(&GLOBAL));
+        draw_help(frame, body, &rows);
     }
 }
 
 /// The key help, centred over `area`.
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let lines: Vec<Line<'_>> = BINDINGS
+fn draw_help(frame: &mut Frame<'_>, area: Rect, rows: &[HelpRow]) {
+    let lines: Vec<Line<'_>> = rows
         .iter()
-        .map(|binding| {
+        .map(|row| {
             Line::from(vec![
-                Span::raw(format!(" {:<8}", binding.label)).bold(),
-                Span::raw(binding.what),
+                Span::raw(format!(" {:<8}", row.label)).bold(),
+                Span::raw(row.what),
             ])
         })
         .collect();
@@ -75,25 +69,4 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(lines).block(Block::bordered().title(" Keys ")),
         popup,
     );
-}
-
-/// One row of the Repo list: name, markers, description.
-fn repo_line(repo: &Repo) -> Line<'_> {
-    let mut spans = vec![Span::styled(
-        format!(" {}", repo.name),
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
-    for (flag, label) in [
-        (repo.fork, "fork"),
-        (repo.private, "private"),
-        (repo.archived, "archived"),
-    ] {
-        if flag {
-            spans.push(Span::raw(format!(" [{label}]")).dim());
-        }
-    }
-    if let Some(description) = &repo.description {
-        spans.push(Span::raw(format!("  {description}")));
-    }
-    Line::from(spans)
 }

@@ -7,6 +7,7 @@ use clap::Parser;
 
 use gh_client::{ApiBase, Token};
 
+use crate::pins::{PinStore, PinsError};
 use crate::{API_URL_VAR, Environment};
 
 /// Token variables, in priority order.
@@ -23,6 +24,7 @@ struct Cli {}
 
 /// What to do after [`prepare`].
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Built once at start-up and moved at once: boxing would only add noise.
 pub enum Launch {
     /// End the program with this exit code; the text is already written. Codes: `0` for `--help` and
     /// `--version`, `1` for a start-up error (no token, invalid `GHU_API_URL`, HTTP client setup), `2` for a
@@ -34,10 +36,14 @@ pub enum Launch {
 
 /// Everything the TUI needs, resolved at start-up. Opaque: only [`prepare`] builds it.
 ///
-/// Owns the GitHub client (base URL + token). `Send`, moved into [`crate::run`] or [`crate::Ui::new`]. Its
-/// `Debug` never shows the token. Later tickets add fields (pinned-repo file, editor command).
+/// Owns the GitHub client (base URL + token) and the Pinned repos store. `Send`, moved into [`crate::run`] or
+/// [`crate::Ui::new`]. Its `Debug` never shows the token. Later tickets add fields (editor command, #9).
 pub struct Context {
     pub(crate) client: gh_client::Client,
+    /// Loaded by [`prepare`] from [`Environment::config_dir`] (ADR 0002).
+    pub(crate) pins: PinStore,
+    /// Why the Pinned repos file could not be read, shown by the Repo list as its first notice.
+    pub(crate) pins_problem: Option<PinsError>,
 }
 
 impl std::fmt::Debug for Context {
@@ -58,6 +64,8 @@ impl std::fmt::Debug for Context {
 ///   names `GH_TOKEN`, `GITHUB_TOKEN` and `gh auth login`, then [`Launch::Exit(1)`].
 /// - API URL: [`crate::API_URL_VAR`] if set and non-empty, else the default; invalid: a message on `err` naming the
 ///   variable and the reason, then [`Launch::Exit(1)`].
+/// - Pinned repos: loaded with `PinStore::load(env.config_dir())` (never ends the program: a bad file is reported in
+///   the TUI and pinning is disabled for the session). Only once the token and URL are valid.
 /// - The token never appears in `out`, `err` or logs. No network access here (a refused token shows in the TUI).
 ///
 /// Write errors on `out`/`err` are ignored. Blocking (may run `gh`); call before starting the TUI.
@@ -109,7 +117,14 @@ where
     tracing::debug!(api = base.as_str(), "start-up settings resolved");
 
     match gh_client::Client::new(base, token) {
-        Ok(client) => Launch::Tui(Context { client }),
+        Ok(client) => {
+            let (pins, pins_problem) = (PinStore::in_memory(), None);
+            Launch::Tui(Context {
+                client,
+                pins,
+                pins_problem,
+            })
+        }
         Err(error) => {
             let _ = writeln!(err, "ghu: {error}");
             Launch::Exit(1)

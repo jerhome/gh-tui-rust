@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-26 16:29.
+Mis à jour le 2026-11-26 16:44.
 
 ## État
 
@@ -14,8 +14,15 @@ Mis à jour le 2026-11-26 16:29.
 
 ## Prochaine action
 
-1. #3, #4, #5, #11 débloqués : `/mattpocock-skills:implement-spec` (un dev par ticket et par worktree) ou `implement`
-   ticket par ticket. Lire les tickets et leurs blocages (`gh issue view` en jerhome).
+Ticket #11 fermé (CI verte Linux/Windows/macOS, ba6b1c9). #3, #4, #5 en cours selon l'ADR 0002 (contrat et squelette de
+l'architecte commités) :
+
+1. Vague 1 (worktrees `../gh-tui-rust-wt-{fake,client,pins}`, branches `wip-345-*`, target commun) : dev[fake],
+   dev[client], dev[pins].
+2. Fusion vague 1 → vérification → commit. Vague 2 : dev[tui-repos] (opus, #3 + #4), dev[tui-pulls] (#5).
+3. Fusion vague 2, retrait des `#[allow(dead_code)]` « Skeleton » de ui.rs → qa → relecteur ×2 → commit
+   `Closes #3 #4 #5` → push.
+4. Ensuite : architecte pour le contrat de #6 à #10.
 
 ## Points ouverts
 

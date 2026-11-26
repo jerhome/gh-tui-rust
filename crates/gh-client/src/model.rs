@@ -52,6 +52,12 @@ impl RepoName {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// `true` if both name the same GitHub repo: owner and name compared ASCII case-insensitively, as GitHub
+    /// does (`Alice/Notes` and `alice/notes` are the same repo). Use it to deduplicate; `==` stays exact.
+    pub fn same_repo(&self, other: &RepoName) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+    }
 }
 
 impl FromStr for RepoName {
@@ -105,6 +111,120 @@ pub struct Repo {
     pub fork: bool,
     /// Archived repo: read-only (glossary: Archived repo).
     pub archived: bool,
+}
+
+/// The number of a pull request within its repo (GitHub's `number`, shown as `#12`). Never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PrNumber(u64);
+
+impl PrNumber {
+    /// `None` for `0` (GitHub numbers start at 1).
+    pub const fn new(number: u64) -> Option<Self> {
+        if number == 0 {
+            None
+        } else {
+            Some(Self(number))
+        }
+    }
+
+    /// The number as GitHub sends it.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PrNumber {
+    /// `#<number>`, for example `#12`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// An instant as GitHub's REST API writes it: `YYYY-MM-DDTHH:MM:SSZ` (UTC, no fraction, no offset).
+///
+/// Invariant (checked by [`Timestamp::parse`]): exactly 20 ASCII characters in that shape, digits where digits are
+/// expected, month 01-12, day 01-31, hour 00-23, minute and second 00-59 (calendar validity of the day, such as
+/// February 30, is not checked). Ordering is chronological (lexicographic on that fixed shape). No time zone
+/// conversion: ghu shows UTC dates (ADR 0002).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Timestamp(String);
+
+impl Timestamp {
+    /// Parses GitHub's `YYYY-MM-DDTHH:MM:SSZ`; `None` for anything else (offsets, fractions, lowercase `z`,
+    /// surrounding spaces). Pure, never panics.
+    pub fn parse(text: &str) -> Option<Self> {
+        todo!("dev[client]: validate {text:?} as described on Timestamp")
+    }
+
+    /// The text as GitHub sent it, `YYYY-MM-DDTHH:MM:SSZ`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The UTC date part, `YYYY-MM-DD` (what the PR list shows).
+    pub fn date(&self) -> &str {
+        &self.0[..10]
+    }
+}
+
+impl fmt::Display for Timestamp {
+    /// Same as [`Timestamp::as_str`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The PR state (glossary: PR state). A Draft PR is an open PR whose author marked it as not ready.
+///
+/// Mapping from GitHub's JSON: `state: "open"` → [`PrState::Open`] with `draft` from the `draft` field
+/// (`false` when absent); `state: "closed"` with a non-null `merged_at` → [`PrState::Merged`]; `state: "closed"`
+/// otherwise → [`PrState::Closed`]. The `draft` flag of a closed or merged PR is dropped. Any other `state` is an
+/// [`Error::UnexpectedResponse`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrState {
+    /// Open; `draft` marks a Draft PR.
+    Open {
+        /// The author marked it as not ready for review.
+        draft: bool,
+    },
+    /// Closed without being merged.
+    Closed,
+    /// Merged (GitHub reports it as closed with a merge date).
+    Merged,
+}
+
+impl PrState {
+    /// `true` for [`PrState::Open`], draft or not (only an open PR can be reviewed or commented on).
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+}
+
+/// Which PRs [`crate::Client::pulls`] asks for: GitHub's `state` query of `GET /repos/{owner}/{repo}/pulls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PullFilter {
+    /// `state=open`: open PRs, drafts included.
+    Open,
+    /// `state=closed`: closed and merged PRs (GitHub returns both for `closed`).
+    Closed,
+}
+
+/// A pull request as listed by GitHub (glossary: Pull request).
+///
+/// `#[non_exhaustive]`: the detail screen (#6) adds fields (branches, body…); only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullRequest {
+    /// Number within the repo.
+    pub number: PrNumber,
+    /// Title, as GitHub sends it (may be empty).
+    pub title: String,
+    /// Login of the author (`user.login`); `ghost` when GitHub sends `user: null` (deleted account).
+    pub author: String,
+    /// Open (draft or not), closed or merged.
+    pub state: PrState,
+    /// Last update (`updated_at`).
+    pub updated_at: Timestamp,
 }
 
 #[cfg(test)]

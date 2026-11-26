@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,6 +32,9 @@ pub struct TestEnv {
     pub gh_auth_token: Option<String>,
     /// How many times `gh auth token` was run (shared between clones).
     pub gh_runs: Arc<AtomicUsize>,
+    /// What [`Environment::config_dir`] returns. `None` by default (pins in memory only), so a test never touches
+    /// the real configuration directory; [`Harness`] sets a temporary directory.
+    pub config_dir: Option<PathBuf>,
 }
 
 impl TestEnv {
@@ -62,6 +66,10 @@ impl Environment for TestEnv {
     fn gh_auth_token(&self) -> Option<String> {
         self.gh_runs.fetch_add(1, Ordering::SeqCst);
         self.gh_auth_token.clone()
+    }
+
+    fn config_dir(&self) -> Option<PathBuf> {
+        self.config_dir.clone()
     }
 }
 
@@ -129,35 +137,62 @@ impl LogCapture {
     }
 }
 
-/// The application on a `TestBackend`, with its fake server.
+/// The application on a `TestBackend`, with its fake server and its own temporary configuration directory.
 pub struct Harness {
     /// The fake GitHub; tests change its state or read its recorded requests.
     pub fake: FakeGitHub,
     ui: Ui<TestBackend>,
+    env: TestEnv,
+    /// Deleted when the harness is dropped.
+    config: tempfile::TempDir,
 }
 
 impl Harness {
-    /// Starts the fake with `state`, then the application with [`TestEnv::for_fake`] and no arguments.
+    /// Starts the fake with `state`, then the application with [`TestEnv::for_fake`], a fresh temporary
+    /// configuration directory and no arguments.
     pub async fn start(state: State) -> Self {
         Self::start_with(state, |_, _| {}).await
     }
 
-    /// Like [`Harness::start`], letting `setup` change the environment first. Panics if `prepare` does not
-    /// return `Launch::Tui`.
+    /// Like [`Harness::start`], letting `setup` change the environment first (`env.config_dir` is already the
+    /// temporary directory; a test may pre-write its Pinned repos file with [`ghu::pinned_repos_path`], or set
+    /// `None`). Panics if `prepare` does not return `Launch::Tui`.
     pub async fn start_with(state: State, setup: impl FnOnce(&mut TestEnv, &FakeGitHub)) -> Self {
         let fake = FakeGitHub::start(state)
             .await
             .expect("start the fake server");
+        let config = tempfile::tempdir().expect("temporary config directory");
         let mut env = TestEnv::for_fake(&fake);
+        env.config_dir = Some(config.path().to_path_buf());
         setup(&mut env, &fake);
-        let (launch, _out, err) = launch(&[], &env);
-        let ctx = match launch {
-            Launch::Tui(ctx) => ctx,
-            Launch::Exit(code) => panic!("prepare exited with {code}: {err}"),
-        };
-        let terminal = Terminal::new(TestBackend::new(SIZE.0, SIZE.1)).expect("test terminal");
-        let ui = Ui::new(terminal, ctx);
-        Self { fake, ui }
+        let ui = new_ui(&env);
+        Self {
+            fake,
+            ui,
+            env,
+            config,
+        }
+    }
+
+    /// Quits and starts the application again with the same environment, configuration directory and fake server
+    /// (whose state and recorded requests are kept): a new session, for persistence tests.
+    pub fn restart(&mut self) {
+        self.ui = new_ui(&self.env);
+    }
+
+    /// The temporary configuration directory (what `Environment::config_dir` returns unless `setup` changed it).
+    pub fn config_dir(&self) -> &Path {
+        self.config.path()
+    }
+
+    /// The Pinned repos file of this harness: `ghu::pinned_repos_path(self.config_dir())`.
+    pub fn pinned_file(&self) -> PathBuf {
+        ghu::pinned_repos_path(self.config_dir())
+    }
+
+    /// Sends a pasted block of text (bracketed paste).
+    pub fn paste(&mut self, text: &str) {
+        self.ui.input(Input::Paste(text.to_owned()));
     }
 
     /// Sends a key press without modifiers.
@@ -237,4 +272,15 @@ impl Harness {
     pub fn is_finished(&self) -> bool {
         self.ui.is_finished()
     }
+}
+
+/// Runs `prepare` with `env` and no arguments, and builds the application on a [`SIZE`] test terminal.
+fn new_ui(env: &TestEnv) -> Ui<TestBackend> {
+    let (launch, _out, err) = launch(&[], env);
+    let ctx = match launch {
+        Launch::Tui(ctx) => ctx,
+        Launch::Exit(code) => panic!("prepare exited with {code}: {err}"),
+    };
+    let terminal = Terminal::new(TestBackend::new(SIZE.0, SIZE.1)).expect("test terminal");
+    Ui::new(terminal, ctx)
 }

@@ -9,8 +9,18 @@
 //!   ([`State::requests`]), authentication (`Authorization: Bearer <State::token>` or `token <…>`, else 401
 //!   `Bad credentials`, or `Requires authentication` without the header), injected [`Failure`]s, then the route.
 //!   An unknown route answers 404 `{"message": "Not Found"}`.
-//! - Routes for ticket #2: `GET /user/repos` (query `affiliation`, `per_page`, `page`). Later tickets add routes
-//!   and `State` fields; existing ones keep their meaning.
+//! - Routes (later tickets add routes and `State` fields; existing ones keep their meaning):
+//!   - `GET /user/repos` (#2): query `affiliation` (default all three), `per_page`, `page`; sorted by
+//!     `owner/name` case-insensitively; [`Access::NoAffiliation`] repos never listed.
+//!   - `GET /repos/{owner}/{repo}` (#4): the repo of [`State::repos`] whose owner and name match
+//!     case-insensitively, whatever its [`Access`], with its canonical `full_name`; else 404 `Not Found`.
+//!   - `GET /repos/{owner}/{repo}/pulls` (#5): 404 `Not Found` if the repo is not in [`State::repos`]; else its
+//!     [`State::pulls`] filtered by `state` (`open` default, `closed` = closed and merged, `all`; anything else:
+//!     422 `Validation Failed`), sorted by `sort` (`created` default, `updated`) and `direction` (`desc`
+//!     default, `asc`), ties broken by `number` descending.
+//!   - Every list route paginates the same way: `per_page` (default 30, capped by [`State::max_per_page`]),
+//!     `page` (default 1), and a `Link` header with `next` and `last` (absolute URLs on the fake's address,
+//!     keeping the other query parameters) while a next page exists.
 //!
 //! Threads: the server runs as a task on the tokio runtime that called [`FakeGitHub::start`]; works on a
 //! current-thread runtime (`#[tokio::test]`). [`State`] is behind a `std::sync::Mutex`, never held across an
@@ -22,7 +32,9 @@ mod state;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-pub use state::{Access, Failure, FailureResponse, Method, RecordedRequest, Repo, State, User};
+pub use state::{
+    Access, Failure, FailureResponse, Method, Pull, PullState, RecordedRequest, Repo, State, User,
+};
 
 /// The token [`State::new`] and [`State::demo`] accept.
 pub const DEFAULT_TOKEN: &str = "ghu-fake-token";

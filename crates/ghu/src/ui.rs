@@ -1,22 +1,38 @@
-//! The application, independent of the real terminal. Private submodules (state, update, rendering, background
-//! tasks) are free for the `dev` lot to organise under `src/ui/` or `src/app/`.
+//! The application, independent of the real terminal (ADR 0001; screens and navigation: ADR 0002).
+//!
+//! Layout of `src/ui/` (one module per screen, so screens are built in parallel without touching the same file):
+//!
+//! - `ui.rs` (this file): [`Ui`], the screen stack, key dispatch, background requests ([`Shared`], [`Outcome`],
+//!   [`RequestId`]), user messages for errors ([`error_message`]). Changed only by the `architecte` (a new route
+//!   adds an [`Outcome`] variant; a new screen adds nothing here).
+//! - `keys.rs`: key map types and the global table.
+//! - `render.rs`: the frame (header, body of the top screen, footer with loading indicator and notice, help).
+//! - `repo_list.rs`: the Repo list screen (#2, #3, #4), root of the stack.
+//! - `pulls.rs`: the PR list of one repo (#5).
 
 mod keys;
+mod pulls;
 mod render;
+mod repo_list;
 
-use gh_client::{Affiliation, Repo};
+use gh_client::{PullRequest, Repo};
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::{Context, KeyEvent};
+
+pub(crate) use keys::HelpRow;
 
 /// An input event from the user's terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     /// A key press (key releases and repeats are filtered out before).
     Key(KeyEvent),
-    /// Text pasted in one block (bracketed paste).
+    /// Text pasted in one block (bracketed paste). Goes to the top screen while it is editing text; ignored
+    /// otherwise.
     Paste(String),
     /// The terminal was resized; the next draw adapts.
     Resize,
@@ -28,9 +44,11 @@ pub enum Input {
 /// its own tokio task with a clone of the client; its result comes back through an internal channel and is
 /// applied by [`Ui::recv_background`]. A panic in such a task is turned into an error shown on screen, not a crash.
 /// While at least one request is in flight, the screen shows a loading indicator (text `Loading`), and keys keep
-/// working (help, quit).
+/// working (help, quit, back). Disk access is limited to the Pinned repos file (a few hundred bytes, written on
+/// pin and unpin from the calling thread).
 ///
-/// Owned by one task; not `Sync`. Must be created and used inside a tokio runtime (current-thread is enough).
+/// Owned by one task; not `Send` nor `Sync`. Must be created and used inside a tokio runtime (current-thread is
+/// enough).
 pub struct Ui<B: Backend> {
     terminal: Terminal<B>,
     app: App,
@@ -38,49 +56,166 @@ pub struct Ui<B: Backend> {
 
 /// The state drawn on screen, separate from the terminal so drawing can borrow both.
 pub(crate) struct App {
-    client: gh_client::Client,
-    pub(crate) repos: RepoList,
+    pub(crate) shared: Shared,
+    rx: mpsc::UnboundedReceiver<(RequestId, Outcome)>,
+    /// The screens, root first. Never empty: `stack[0]` is the Repo list and is never popped.
+    pub(crate) stack: Vec<Box<dyn View>>,
     pub(crate) help: bool,
     pub(crate) finished: bool,
     pub(crate) spinner: usize,
-    in_flight: usize,
-    tx: mpsc::UnboundedSender<Outcome>,
-    rx: mpsc::UnboundedReceiver<Outcome>,
 }
 
-/// What the Repo list shows.
-pub(crate) enum RepoList {
-    /// The first answer has not come yet.
-    Loading,
-    /// The repos, in GitHub's order.
-    Loaded(Vec<Repo>),
-    /// The request failed: a message for the user.
-    Failed(String),
-}
+/// Identifies one background request, so its answer reaches the screen that asked for it, and only if that screen
+/// still waits for this very request (a screen that reloads, or was left with `Esc`, ignores older answers).
+/// Unique for the life of the [`Ui`]; given by [`Shared::spawn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RequestId(u64);
 
-/// The result of a background request.
-enum Outcome {
-    Repos(Result<Vec<Repo>, gh_client::Error>),
-    /// The task panicked or was cancelled.
+/// The result of a background request. One variant per client route; a new route adds a variant here.
+#[derive(Debug)]
+#[allow(dead_code)] // Skeleton (architecte): `Repo` and `Pulls` are built by dev[tui-repos] and dev[tui-pulls], who remove this.
+pub(crate) enum Outcome {
+    /// [`gh_client::Client::user_repos`].
+    Repos(gh_client::Result<Vec<Repo>>),
+    /// [`gh_client::Client::repo`] (a pinned repo at start-up or refresh, or a repo typed as `owner/name`).
+    Repo(gh_client::Result<Repo>),
+    /// [`gh_client::Client::pulls`].
+    Pulls(gh_client::Result<Vec<PullRequest>>),
+    /// The task panicked or was cancelled; show [`TASK_FAILED`].
     TaskFailed,
 }
 
+/// Message for [`Outcome::TaskFailed`].
+pub(crate) const TASK_FAILED: &str = "Internal error: a background task failed (see the log).";
+
+/// A one-line message in the footer, in place of the key hints, until the next key press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Skeleton (architecte): `Info` is used by dev[tui-repos], who removes this.
+pub(crate) enum Notice {
+    /// Neutral information (`Pinned alice/notes.`).
+    Info(String),
+    /// Something failed (drawn in red).
+    Error(String),
+}
+
+/// What every screen may use: the GitHub client, background requests, the notice line. Owned by [`App`], lent
+/// to the top screen for each call.
+pub(crate) struct Shared {
+    client: gh_client::Client,
+    tx: mpsc::UnboundedSender<(RequestId, Outcome)>,
+    in_flight: usize,
+    next_id: u64,
+    pub(crate) notice: Option<Notice>,
+}
+
+impl Shared {
+    /// The GitHub client, to clone into a request's future.
+    pub(crate) fn client(&self) -> &gh_client::Client {
+        &self.client
+    }
+
+    /// Runs `work` in its own tokio task and returns the id its outcome will carry. The outcome (or
+    /// [`Outcome::TaskFailed`] if the task panics) is later given to [`View::apply`] of the screens, top first,
+    /// until one claims it. Counts as in flight (loading indicator) until applied, even if no screen claims it.
+    pub(crate) fn spawn(
+        &mut self,
+        work: impl Future<Output = Outcome> + Send + 'static,
+    ) -> RequestId {
+        let id = RequestId(self.next_id);
+        self.next_id += 1;
+        self.in_flight += 1;
+        let tx = self.tx.clone();
+        let inner = tokio::spawn(work);
+        tokio::spawn(async move {
+            let outcome = inner.await.unwrap_or_else(|error| {
+                tracing::error!(%error, "background task failed");
+                Outcome::TaskFailed
+            });
+            // The receiver lives as long as the `Ui`; once it is dropped nobody needs the result.
+            let _ = tx.send((id, outcome));
+        });
+        id
+    }
+
+    /// Shows `notice` in the footer (replacing any previous one) until the next key press.
+    pub(crate) fn notify(&mut self, notice: Notice) {
+        self.notice = Some(notice);
+    }
+
+    /// `true` while at least one background request is in flight.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.in_flight > 0
+    }
+}
+
+/// What a screen asks the application to do after a key.
+#[allow(dead_code)] // Skeleton (architecte): `Pop` has no user yet; remove this once a screen returns it.
+pub(crate) enum Flow {
+    /// The screen does not use this key: the global table is tried (`?`, `Esc`, `q`).
+    Ignored,
+    /// The screen used the key.
+    Handled,
+    /// Open a new screen on top (for example the PR list after `Enter` on a repo).
+    Push(Box<dyn View>),
+    /// Close this screen and go back to the previous one (ignored on the root).
+    Pop,
+}
+
+/// A screen of the stack (ADR 0002). Point of variation: one implementation per screen module.
+///
+/// All methods are called on the UI task, never block on the network (requests go through [`Shared::spawn`]), and
+/// must not panic on any input or outcome.
+pub(crate) trait View {
+    /// Header text after `ghu · `, for example `Repo list` or `alice/notes · Pull requests (open)`.
+    fn title(&self) -> String;
+
+    /// This screen's rows of the `?` help (shown before the global ones). Usually `keys::help_rows(&TABLE)`.
+    fn help(&self) -> Vec<HelpRow>;
+
+    /// `true` while a text field of this screen has the focus (filter, `owner/name` prompt). Then every key but
+    /// `Ctrl-C` goes to [`View::key`] first and the global table is not tried (`q` and `?` are text), and pastes go
+    /// to [`View::paste`].
+    fn editing(&self) -> bool {
+        false
+    }
+
+    /// Handles a key press. Not called for `Ctrl-C`, nor while the help is shown.
+    fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow;
+
+    /// Inserts pasted text in the focused field; called only while [`View::editing`].
+    fn paste(&mut self, text: &str, shared: &mut Shared) {
+        let _ = (text, shared);
+    }
+
+    /// Offers a background result. Returns `None` if this screen was waiting for `id` and took it, else gives the
+    /// outcome back (`Some`) so the screen below is offered it. A result nobody claims is dropped (stale).
+    fn apply(&mut self, id: RequestId, outcome: Outcome, shared: &mut Shared) -> Option<Outcome>;
+
+    /// Draws the screen's body in `area` (between header and footer). May place the cursor for a text field.
+    fn render(&self, frame: &mut Frame<'_>, area: Rect);
+}
+
 impl<B: Backend> Ui<B> {
-    /// Takes ownership of the terminal and the context, and starts the first screen: the Repo list, whose loading
-    /// (the user's own repos, ticket #2) starts at once in the background. Draws nothing yet.
+    /// Takes ownership of the terminal and the context, and opens the first screen, the Repo list, whose loading
+    /// starts at once in the background (see `repo_list.rs`). Draws nothing yet.
     pub fn new(terminal: Terminal<B>, ctx: Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App {
+        let mut shared = Shared {
             client: ctx.client,
-            repos: RepoList::Loading,
+            tx,
+            in_flight: 0,
+            next_id: 0,
+            notice: None,
+        };
+        let root = repo_list::RepoListScreen::new(&mut shared, ctx.pins, ctx.pins_problem);
+        let app = App {
+            shared,
+            rx,
+            stack: vec![Box::new(root)],
             help: false,
             finished: false,
             spinner: 0,
-            in_flight: 0,
-            tx,
-            rx,
         };
-        app.load_repos();
         Self { terminal, app }
     }
 
@@ -89,8 +224,10 @@ impl<B: Backend> Ui<B> {
         if self.app.finished {
             return;
         }
-        if let Input::Key(key) = input {
-            self.app.key(key);
+        match input {
+            Input::Key(key) => self.app.key(key),
+            Input::Paste(text) => self.app.paste(&text),
+            Input::Resize => {}
         }
     }
 
@@ -99,12 +236,12 @@ impl<B: Backend> Ui<B> {
     /// Cancel-safe (meant for `tokio::select!` against input, or a test timeout). Never resolves while nothing is
     /// in flight.
     pub async fn recv_background(&mut self) {
-        if self.app.in_flight == 0 {
+        if !self.app.shared.is_busy() {
             std::future::pending::<()>().await;
         }
         // `recv` is cancel-safe; the sender half lives in `self.app`, so it never returns `None`.
-        if let Some(outcome) = self.app.rx.recv().await {
-            self.app.apply(outcome);
+        if let Some((id, outcome)) = self.app.rx.recv().await {
+            self.app.apply(id, outcome);
         }
     }
 
@@ -134,67 +271,91 @@ impl<B: Backend> Ui<B> {
 
     /// `true` while at least one background request is in flight.
     pub fn is_busy(&self) -> bool {
-        self.app.in_flight > 0
+        self.app.shared.is_busy()
     }
 }
 
 impl App {
-    /// `true` while at least one background request is in flight.
-    pub(crate) fn is_busy(&self) -> bool {
-        self.in_flight > 0
+    /// The screen on top of the stack.
+    pub(crate) fn top(&self) -> &dyn View {
+        self.stack
+            .last()
+            .expect("the stack is never empty")
+            .as_ref()
     }
 
+    /// Key dispatch (ADR 0002): `Ctrl-C` quits from anywhere; any key clears the notice; while the help is shown
+    /// only `?`, `Esc` (close) and `q` (quit) act; while the top screen is editing, it gets every key; otherwise
+    /// the top screen first, then the global table if it returned [`Flow::Ignored`].
     fn key(&mut self, key: KeyEvent) {
-        match keys::action(key) {
-            Some(keys::Action::Quit) => self.finished = true,
-            Some(keys::Action::ToggleHelp) => self.help = !self.help,
-            Some(keys::Action::Back) => self.help = false,
-            None => {}
+        if keys::is_ctrl_c(key) {
+            self.finished = true;
+            return;
+        }
+        self.shared.notice = None;
+        if self.help {
+            match keys::lookup(&keys::GLOBAL, key) {
+                Some(keys::Global::Quit) => self.finished = true,
+                Some(keys::Global::ToggleHelp | keys::Global::Back) => self.help = false,
+                None => {}
+            }
+            return;
+        }
+        let top = self.stack.last_mut().expect("the stack is never empty");
+        let editing = top.editing();
+        let flow = top.key(key, &mut self.shared);
+        match flow {
+            Flow::Handled => {}
+            Flow::Push(view) => self.stack.push(view),
+            Flow::Pop => self.pop(),
+            Flow::Ignored if editing => {}
+            Flow::Ignored => match keys::lookup(&keys::GLOBAL, key) {
+                Some(keys::Global::Quit) => self.finished = true,
+                Some(keys::Global::ToggleHelp) => self.help = true,
+                Some(keys::Global::Back) => self.pop(),
+                None => {}
+            },
         }
     }
 
-    /// Starts loading the user's own repos in the background.
-    fn load_repos(&mut self) {
-        let client = self.client.clone();
-        self.spawn(async move { Outcome::Repos(client.user_repos(&[Affiliation::Owner]).await) });
+    /// Goes back one screen; does nothing on the root.
+    fn pop(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+        }
     }
 
-    /// Runs `work` in its own task; its outcome (or [`Outcome::TaskFailed`] if it panics) comes back on the channel.
-    fn spawn(&mut self, work: impl Future<Output = Outcome> + Send + 'static) {
-        self.in_flight += 1;
-        let tx = self.tx.clone();
-        let inner = tokio::spawn(work);
-        tokio::spawn(async move {
-            let outcome = inner.await.unwrap_or_else(|error| {
-                tracing::error!(%error, "background task failed");
-                Outcome::TaskFailed
-            });
-            // The receiver lives as long as the `Ui`; once it is dropped nobody needs the result.
-            let _ = tx.send(outcome);
-        });
+    fn paste(&mut self, text: &str) {
+        if self.help {
+            return;
+        }
+        let top = self.stack.last_mut().expect("the stack is never empty");
+        if top.editing() {
+            top.paste(text, &mut self.shared);
+        }
     }
 
-    fn apply(&mut self, outcome: Outcome) {
-        self.in_flight = self.in_flight.saturating_sub(1);
-        self.repos = match outcome {
-            Outcome::Repos(Ok(repos)) => {
-                tracing::debug!(count = repos.len(), "repos loaded");
-                RepoList::Loaded(repos)
+    /// Offers the outcome to the screens, top first, until one claims it.
+    fn apply(&mut self, id: RequestId, outcome: Outcome) {
+        self.shared.in_flight = self.shared.in_flight.saturating_sub(1);
+        let mut outcome = outcome;
+        for view in self.stack.iter_mut().rev() {
+            match view.apply(id, outcome, &mut self.shared) {
+                None => return,
+                Some(unclaimed) => outcome = unclaimed,
             }
-            Outcome::Repos(Err(error)) => {
-                tracing::warn!(%error, "loading repos failed");
-                RepoList::Failed(error_message(&error))
-            }
-            Outcome::TaskFailed => RepoList::Failed(
-                "Internal error: a background task failed (see the log).".to_owned(),
-            ),
-        };
+        }
+        tracing::debug!(?id, "stale background result dropped");
     }
 }
 
-/// The message shown for a failed request: one per error variant, written here (the `Display` of the error is
-/// for logs, see gh-client's `Error`). Never built from GitHub's free text or from the error's fields.
-fn error_message(error: &gh_client::Error) -> String {
+/// The message shown for a failed request: `Cannot <action>: <reason>`, one reason per error variant, written
+/// here (the `Display` of the error is for logs, see gh-client's `Error`). Never built from GitHub's free text or
+/// from the error's fields, except the HTTP status of [`gh_client::Error::Api`].
+///
+/// `action` is a lowercase verb phrase: `load the repos`, `open bob/tools`, `load the pull requests`. A 401
+/// gives a full sentence of its own that names `GH_TOKEN`, `GITHUB_TOKEN` and `gh auth login`, whatever the action.
+pub(crate) fn error_message(action: &str, error: &gh_client::Error) -> String {
     use gh_client::Error;
     let reason = match error {
         Error::Unauthorized => {
@@ -203,25 +364,29 @@ fn error_message(error: &gh_client::Error) -> String {
                 .to_owned();
         }
         Error::Network { .. } => {
-            "no answer from GitHub. Check your connection, the proxy and GHU_API_URL."
+            "no answer from GitHub. Check your connection, the proxy and GHU_API_URL.".to_owned()
         }
-        Error::RateLimited { .. } => "GitHub rate limit exceeded. Wait a few minutes and refresh.",
+        Error::RateLimited { .. } => {
+            "GitHub rate limit exceeded. Wait a few minutes and refresh.".to_owned()
+        }
         Error::Forbidden { .. } => {
-            "GitHub denied access (403). The token may lack the required scope."
+            "GitHub denied access (403). The token may lack the required scope.".to_owned()
         }
-        Error::NotFound => "not found on GitHub (404).",
-        Error::Unprocessable { .. } => "GitHub refused the request (422).",
-        Error::Api { status, .. } => {
-            return format!(
-                "Cannot load the repos: GitHub answered with an error (HTTP {status})."
-            );
+        Error::NotFound => {
+            "not found on GitHub (404): it does not exist or this token cannot see it.".to_owned()
         }
-        Error::UnexpectedResponse { .. } => "GitHub sent an answer that ghu cannot read.",
-        Error::InvalidBaseUrl { .. } => "the GitHub API URL is invalid. Check GHU_API_URL.",
-        Error::InvalidRepoName { .. } => "invalid repo name.",
-        Error::ClientSetup { .. } => "the HTTP client could not be set up.",
+        Error::Unprocessable { .. } => "GitHub refused the request (422).".to_owned(),
+        Error::Api { status, .. } => format!("GitHub answered with an error (HTTP {status})."),
+        Error::UnexpectedResponse { .. } => {
+            "GitHub sent an answer that ghu cannot read.".to_owned()
+        }
+        Error::InvalidBaseUrl { .. } => {
+            "the GitHub API URL is invalid. Check GHU_API_URL.".to_owned()
+        }
+        Error::InvalidRepoName { .. } => "invalid repo name: type owner/name.".to_owned(),
+        Error::ClientSetup { .. } => "the HTTP client could not be set up.".to_owned(),
         // `Error` is non-exhaustive: a future variant gets a generic message until it has its own.
-        _ => "an unexpected error occurred (see the log).",
+        _ => "an unexpected error occurred (see the log).".to_owned(),
     };
-    format!("Cannot load the repos: {reason}")
+    format!("Cannot {action}: {reason}")
 }

@@ -10,7 +10,7 @@ use url::Url;
 use crate::link::next_link;
 use crate::status::{classify, redact};
 use crate::wire::decode_repos;
-use crate::{Affiliation, ApiBase, Error, Repo, Result, Token};
+use crate::{Affiliation, ApiBase, Error, PullFilter, PullRequest, Repo, RepoName, Result, Token};
 
 /// Largest body read from one answer: a page of 100 repos is far below it; the limit only bounds memory.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -101,8 +101,9 @@ impl Client {
     /// `GET /user/repos?affiliation=…&per_page=100`, following every `next` page.
     ///
     /// `affiliations` is sent as a comma-separated list, deduplicated; an empty slice sends all three (GitHub's
-    /// own default). Order: as GitHub returns it (by `full_name`), pages concatenated. Archived repos and forks
-    /// are included; filtering is the caller's job.
+    /// own default). Order: as GitHub returns it (by `full_name`), pages concatenated; a repo seen twice (same
+    /// name by [`RepoName::same_repo`], for example after pagination drift) is kept once, at its first position
+    /// (#3). Archived repos and forks are included; filtering is the caller's job.
     ///
     /// Errors: [`crate::Error::Unauthorized`], [`crate::Error::RateLimited`], [`crate::Error::Forbidden`],
     /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`] (also for a `next` link outside the base
@@ -137,6 +138,30 @@ impl Client {
             };
             url = self.next_page_url(&url, next)?;
         }
+    }
+
+    /// `GET /repos/{owner}/{repo}`: one repo by name (glossary: Pinned repo; opening `owner/name`, #4).
+    ///
+    /// The path is built from [`RepoName`]'s parts, whose characters need no escaping. The returned
+    /// [`Repo::name`] is GitHub's `full_name` (canonical case), which may differ in case from `name`.
+    ///
+    /// Errors: [`crate::Error::NotFound`] for a missing repo or one this token cannot see (GitHub answers 404 for
+    /// both), [`crate::Error::Unauthorized`], [`crate::Error::RateLimited`], [`crate::Error::Forbidden`],
+    /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`], [`crate::Error::Api`]. A redirect (3xx, GitHub's
+    /// answer for a renamed repo) is not followed and is an [`crate::Error::Api`] with its status.
+    pub async fn repo(&self, name: &RepoName) -> Result<Repo> {
+        todo!("dev[client]: GET /repos/{name}")
+    }
+
+    /// `GET /repos/{owner}/{repo}/pulls?state=open|closed&sort=updated&direction=desc&per_page=100`, following
+    /// every `next` page (#5).
+    ///
+    /// Order: most recently updated first, as GitHub returns it, pages concatenated; a PR seen twice (pagination
+    /// drift) is kept once, at its first position. [`PullFilter::Closed`] returns closed and merged PRs together.
+    ///
+    /// Errors: as [`Client::user_repos`], plus [`crate::Error::NotFound`] when the repo is missing or invisible.
+    pub async fn pulls(&self, repo: &RepoName, filter: PullFilter) -> Result<Vec<PullRequest>> {
+        todo!("dev[client]: GET /repos/{repo}/pulls for {filter:?}")
     }
 
     /// `{base}{path}`.

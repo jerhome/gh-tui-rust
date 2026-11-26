@@ -12,6 +12,10 @@ pub struct State {
     /// Repos the user can see, in any order; `GET /user/repos` returns them sorted by `owner/name`
     /// (case-insensitive), filtered by [`Repo::access`] against the `affiliation` query.
     pub repos: Vec<Repo>,
+    /// Pull requests of every repo, in any order. `GET /repos/{owner}/{repo}/pulls` serves those whose
+    /// [`Pull::owner`]/[`Pull::repo`] match the path (case-insensitive), filtered by `state` and sorted by the
+    /// `sort`/`direction` query (#5).
+    pub pulls: Vec<Pull>,
     /// Delay added before handling every request (default zero). Used to test the loading indicator and that the
     /// UI stays responsive.
     pub latency: Duration,
@@ -32,6 +36,7 @@ impl State {
             token: crate::DEFAULT_TOKEN.to_owned(),
             user,
             repos: Vec::new(),
+            pulls: Vec::new(),
             latency: Duration::ZERO,
             max_per_page: 100,
             failures: Vec::new(),
@@ -39,8 +44,15 @@ impl State {
         }
     }
 
-    /// Demo data (also used by the `gh-fake` binary): user `alice` (id 1) owning at least three repos, one of
-    /// them a fork, one archived, one private with a description. Fictional names only.
+    /// Demo data (also used by the `gh-fake` binary). Fictional names only. Must keep what #2's tests rely on:
+    /// user `alice` (id 1) owning `alice/notes` (description `Plain-text notes and snippets`),
+    /// `alice/secret-garden` (private, with a description), `alice/dotfiles` (fork) and `alice/old-experiments`
+    /// (archived), all [`Access::Owner`].
+    ///
+    /// Added for #3-#5 (dev[fake]): at least one [`Access::Collaborator`] repo of another user, two
+    /// [`Access::OrganizationMember`] repos of an organization, one archived; one [`Access::NoAffiliation`] public
+    /// repo of another user (to open by `owner/name`); and PRs on `alice/notes`: at least two open (one draft),
+    /// one closed, one merged, with distinct `updated_at` and at least two authors.
     pub fn demo() -> Self {
         let mut state = Self::new(User {
             login: "alice".into(),
@@ -112,6 +124,75 @@ pub enum Access {
     Collaborator,
     /// `organization_member`.
     OrganizationMember,
+    /// No affiliation: never listed by `GET /user/repos`, but served by `GET /repos/{owner}/{repo}` (a public repo
+    /// of someone else, opened by typing `owner/name`, #4).
+    NoAffiliation,
+}
+
+/// A pull request of the fake server (JSON of "List pull requests", <https://docs.github.com/en/rest/pulls/pulls>).
+///
+/// JSON fields served: `id` (stable fake id), `number`, `state` (`"open"` or `"closed"`), `title`, `user`
+/// (`{"login", "id", "type": "User"}`, or `null` when [`Pull::author`] is `None`), `body`, `draft`,
+/// `created_at`, `updated_at`, `closed_at` (`null` when open, else `updated_at`), `merged_at` (`updated_at` when
+/// [`PullState::Merged`], else `null`), `head` and `base` (`{"ref", "label": "<owner>:<ref>"}`), `html_url`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pull {
+    /// Owner of the repo the PR belongs to.
+    pub owner: String,
+    /// Name of the repo the PR belongs to.
+    pub repo: String,
+    /// Number within the repo (unique per repo; not checked).
+    pub number: u64,
+    /// Title.
+    pub title: String,
+    /// Author login; `None` serves `"user": null` (deleted account).
+    pub author: Option<String>,
+    /// Open, closed or merged.
+    pub state: PullState,
+    /// `draft` in JSON (served as is, whatever the state).
+    pub draft: bool,
+    /// Description (`body`, `null` when `None`).
+    pub body: Option<String>,
+    /// `created_at`, `YYYY-MM-DDTHH:MM:SSZ` (served as is, not checked).
+    pub created_at: String,
+    /// `updated_at`, same format (served as is, not checked).
+    pub updated_at: String,
+    /// Source branch (`head.ref`).
+    pub head: String,
+    /// Target branch (`base.ref`).
+    pub base: String,
+}
+
+impl Pull {
+    /// An open, non-draft PR of `owner/repo` by `author`, without body, created and updated at
+    /// `2026-01-01T00:00:00Z`, from `feature` into `main`.
+    pub fn new(owner: &str, repo: &str, number: u64, title: &str, author: &str) -> Self {
+        Self {
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            number,
+            title: title.to_owned(),
+            author: Some(author.to_owned()),
+            state: PullState::Open,
+            draft: false,
+            body: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            head: "feature".to_owned(),
+            base: "main".to_owned(),
+        }
+    }
+}
+
+/// State of a fake PR. Served as `state` `"open"` or `"closed"`, plus `merged_at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullState {
+    /// `state: "open"`.
+    Open,
+    /// `state: "closed"`, `merged_at: null`.
+    Closed,
+    /// `state: "closed"`, `merged_at` set.
+    Merged,
 }
 
 /// HTTP method of a route.

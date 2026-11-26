@@ -8,7 +8,7 @@ pub const API_URL_VAR: &str = "GHU_API_URL";
 /// edition 2024 and racy between tests).
 ///
 /// Called only from [`crate::prepare`], on the calling thread, before the TUI starts: may block (runs `gh`).
-/// Later tickets add methods (config directory for pinned repos, editor command).
+/// Later tickets add methods (editor command, #9).
 pub trait Environment {
     /// The value of an environment variable, `None` if unset or not valid Unicode.
     fn var(&self, name: &str) -> Option<String>;
@@ -16,6 +16,11 @@ pub trait Environment {
     /// The standard output of `gh auth token`, or `None` if `gh` is not installed, fails, or prints nothing.
     /// Its stderr is discarded (never shown, never logged).
     fn gh_auth_token(&self) -> Option<String>;
+
+    /// The user's configuration directory of the OS, where ghu keeps `ghu/pinned.toml` (ADR 0002): on Linux
+    /// `$XDG_CONFIG_HOME` or `~/.config`, on Windows `%APPDATA%` (`FOLDERID_RoamingAppData`), on macOS
+    /// `~/Library/Application Support`. `None` if the OS gives none: pins then last for the session only.
+    fn config_dir(&self) -> Option<std::path::PathBuf>;
 }
 
 /// The real environment: `std::env::var` and the `gh` program found on `PATH`.
@@ -40,5 +45,10 @@ impl Environment for SystemEnvironment {
         }
         let text = String::from_utf8(output.stdout).ok()?;
         (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// `dirs::config_dir()`.
+    fn config_dir(&self) -> Option<std::path::PathBuf> {
+        dirs::config_dir()
     }
 }

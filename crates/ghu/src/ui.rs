@@ -1,6 +1,7 @@
 //! The application, independent of the real terminal. Private submodules (state, update, rendering, background
 //! tasks) are free for the `dev` lot to organise under `src/ui/` or `src/app/`.
 
+mod keys;
 mod render;
 
 use gh_client::{Affiliation, Repo};
@@ -8,7 +9,7 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
 
-use crate::{Context, KeyCode, KeyEvent, KeyModifiers};
+use crate::{Context, KeyEvent};
 
 /// An input event from the user's terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,12 +145,11 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.finished = true,
-            (KeyCode::Char('q'), KeyModifiers::NONE) => self.finished = true,
-            (KeyCode::Char('?'), _) => self.help = !self.help,
-            (KeyCode::Esc, _) => self.help = false,
-            _ => {}
+        match keys::action(key) {
+            Some(keys::Action::Quit) => self.finished = true,
+            Some(keys::Action::ToggleHelp) => self.help = !self.help,
+            Some(keys::Action::Back) => self.help = false,
+            None => {}
         }
     }
 
@@ -192,14 +192,36 @@ impl App {
     }
 }
 
-/// The message shown for a failed request.
+/// The message shown for a failed request: one per error variant, written here (the `Display` of the error is
+/// for logs, see gh-client's `Error`). Never built from GitHub's free text or from the error's fields.
 fn error_message(error: &gh_client::Error) -> String {
-    match error {
-        gh_client::Error::Unauthorized => {
-            "GitHub rejected the token (401): it is invalid, expired or revoked. \
-             Set GH_TOKEN or GITHUB_TOKEN to a valid token, or sign in again with: gh auth login"
-                .to_owned()
+    use gh_client::Error;
+    let reason = match error {
+        Error::Unauthorized => {
+            return "GitHub rejected the token (401): it is invalid, expired or revoked. \
+                    Set GH_TOKEN or GITHUB_TOKEN to a valid token, or sign in again with: gh auth login"
+                .to_owned();
         }
-        other => format!("Cannot load the repos: {other}"),
-    }
+        Error::Network { .. } => {
+            "no answer from GitHub. Check your connection, the proxy and GHU_API_URL."
+        }
+        Error::RateLimited { .. } => "GitHub rate limit exceeded. Wait a few minutes and refresh.",
+        Error::Forbidden { .. } => {
+            "GitHub denied access (403). The token may lack the required scope."
+        }
+        Error::NotFound => "not found on GitHub (404).",
+        Error::Unprocessable { .. } => "GitHub refused the request (422).",
+        Error::Api { status, .. } => {
+            return format!(
+                "Cannot load the repos: GitHub answered with an error (HTTP {status})."
+            );
+        }
+        Error::UnexpectedResponse { .. } => "GitHub sent an answer that ghu cannot read.",
+        Error::InvalidBaseUrl { .. } => "the GitHub API URL is invalid. Check GHU_API_URL.",
+        Error::InvalidRepoName { .. } => "invalid repo name.",
+        Error::ClientSetup { .. } => "the HTTP client could not be set up.",
+        // `Error` is non-exhaustive: a future variant gets a generic message until it has its own.
+        _ => "an unexpected error occurred (see the log).",
+    };
+    format!("Cannot load the repos: {reason}")
 }

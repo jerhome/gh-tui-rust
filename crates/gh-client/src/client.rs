@@ -16,6 +16,8 @@ use crate::{Affiliation, ApiBase, Error, Repo, Result, Token};
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Most pages followed for one list; stops a server that loops through different `next` links.
 const MAX_PAGES: usize = 1000;
+/// Most bytes read over all the pages of one list (the per-answer limit alone allows 1000 x 32 MiB).
+const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
 /// GitHub REST v3 client.
 ///
@@ -80,9 +82,14 @@ impl Client {
             // Tests must reach the local fake server even when the environment sets a proxy.
             builder = builder.no_proxy();
         }
-        let http = builder
-            .build()
-            .map_err(|e| setup(redact_text(&e, &token)))?;
+        let http = builder.build().map_err(|e| {
+            redact(
+                Error::ClientSetup {
+                    message: error_chain(&e),
+                },
+                token.expose(),
+            )
+        })?;
         Ok(Self { http, base, token })
     }
 
@@ -99,7 +106,7 @@ impl Client {
     ///
     /// Errors: [`crate::Error::Unauthorized`], [`crate::Error::RateLimited`], [`crate::Error::Forbidden`],
     /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`] (also for a `next` link outside the base
-    /// origin, or a `next` link equal to the page just read), [`crate::Error::Api`].
+    /// origin, or a `next` link equal to the page just read), [`crate::Error::Api`]. The pages together may not exceed 128 MiB (else `UnexpectedResponse`).
     pub async fn user_repos(&self, affiliations: &[Affiliation]) -> Result<Vec<Repo>> {
         let mut url = self.route("/user/repos")?;
         url.query_pairs_mut()
@@ -108,14 +115,19 @@ impl Client {
 
         let mut repos = Vec::new();
         let mut seen = HashSet::new();
+        let mut total_bytes = 0usize;
         loop {
             if !seen.insert(url.clone()) || seen.len() > MAX_PAGES {
                 return Err(
                     self.unexpected("the pagination does not end (repeated or too many pages)")
                 );
             }
-            let (headers, body) = self.get(url.clone()).await?;
-            repos.extend(decode_repos(&body).map_err(|e| redact(e, self.token.expose()))?);
+            let (headers, body) = self.get(url.clone(), body_limit(total_bytes)).await?;
+            total_bytes += body.len();
+            repos.extend(
+                decode_repos(&body, self.token.expose())
+                    .map_err(|e| redact(e, self.token.expose()))?,
+            );
             let Some(next) = headers
                 .get(LINK)
                 .and_then(|v| v.to_str().ok())
@@ -146,7 +158,7 @@ impl Client {
     }
 
     /// One GET; a non-2xx answer becomes the matching [`Error`].
-    async fn get(&self, url: Url) -> Result<(HeaderMap, Vec<u8>)> {
+    async fn get(&self, url: Url, limit: usize) -> Result<(HeaderMap, Vec<u8>)> {
         let mut response = self
             .http
             .get(url)
@@ -157,7 +169,7 @@ impl Client {
         let headers = response.headers().clone();
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|e| self.network(&e))? {
-            if body.len() + chunk.len() > MAX_BODY_BYTES {
+            if body.len().saturating_add(chunk.len()) > limit {
                 return Err(self.unexpected("the answer is too large"));
             }
             body.extend_from_slice(&chunk);
@@ -166,7 +178,7 @@ impl Client {
             Ok((headers, body))
         } else {
             Err(redact(
-                classify(status, &headers, &body),
+                classify(status, &headers, &body, self.token.expose()),
                 self.token.expose(),
             ))
         }
@@ -179,9 +191,12 @@ impl Client {
     }
 
     fn network(&self, error: &reqwest::Error) -> Error {
-        Error::Network {
-            message: redact_text(error, &self.token),
-        }
+        redact(
+            Error::Network {
+                message: error_chain(error),
+            },
+            self.token.expose(),
+        )
     }
 }
 
@@ -214,8 +229,15 @@ fn affiliation_list(affiliations: &[Affiliation]) -> String {
     names.join(",")
 }
 
-/// A transport error as text, without the request URL, with its causes, and without the token.
-fn redact_text(error: &reqwest::Error, token: &Token) -> String {
+/// Per-answer byte limit given the bytes already read for this list: never above [`MAX_BODY_BYTES`], and the
+/// total over all pages never above [`MAX_TOTAL_BYTES`].
+fn body_limit(total_read: usize) -> usize {
+    MAX_BODY_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(total_read))
+}
+
+/// A transport error as text, with its causes (reqwest's `Display` may include the request URL; the token is
+/// never in it, and callers still pass the result through `redact`).
+fn error_chain(error: &reqwest::Error) -> String {
     use std::error::Error as _;
 
     let mut text = error.to_string();
@@ -225,13 +247,21 @@ fn redact_text(error: &reqwest::Error, token: &Token) -> String {
         text.push_str(&cause.to_string());
         source = cause.source();
     }
-    text.replace(token.expose(), "***")
+    text
 }
 
 #[cfg(test)]
 mod tests {
-    use super::affiliation_list;
+    use super::{MAX_BODY_BYTES, MAX_TOTAL_BYTES, affiliation_list, body_limit};
     use crate::Affiliation::{Collaborator, Owner};
+
+    #[test]
+    fn body_limit_caps_each_answer_and_the_total() {
+        assert_eq!(body_limit(0), MAX_BODY_BYTES);
+        assert_eq!(body_limit(MAX_TOTAL_BYTES - 10), 10);
+        assert_eq!(body_limit(MAX_TOTAL_BYTES), 0);
+        assert_eq!(body_limit(usize::MAX), 0);
+    }
 
     #[test]
     fn affiliation_list_deduplicates_and_defaults_to_all() {

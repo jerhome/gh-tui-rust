@@ -7,15 +7,8 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
+use super::keys::BINDINGS;
 use super::{App, RepoList};
-
-/// The key help: key, then what it does.
-const KEYS: [(&str, &str); 4] = [
-    ("?", "Toggle this help"),
-    ("Esc", "Back / close this help"),
-    ("q", "Quit"),
-    ("Ctrl-C", "Quit"),
-];
 
 /// Spinner frames shown before `Loading`.
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -59,12 +52,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
 /// The key help, centred over `area`.
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let lines: Vec<Line<'_>> = KEYS
+    let lines: Vec<Line<'_>> = BINDINGS
         .iter()
-        .map(|(key, what)| {
+        .map(|binding| {
             Line::from(vec![
-                Span::raw(format!(" {key:<8}")).bold(),
-                Span::raw(*what),
+                Span::raw(format!(" {:<8}", binding.label)).bold(),
+                Span::raw(binding.what),
             ])
         })
         .collect();

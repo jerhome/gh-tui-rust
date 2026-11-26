@@ -2,17 +2,20 @@
 
 use serde::Deserialize;
 
+use crate::status::truncate;
 use crate::{Error, Repo, RepoName, Result};
 
 /// Decodes the body of `GET /user/repos` (one page).
 ///
 /// Errors: [`Error::UnexpectedResponse`] for invalid JSON, a missing field or an invalid `full_name`.
-pub(crate) fn decode_repos(body: &[u8]) -> Result<Vec<Repo>> {
+pub(crate) fn decode_repos(body: &[u8], secret: &str) -> Result<Vec<Repo>> {
     let wire: Vec<WireRepo> =
         serde_json::from_slice(body).map_err(|e| Error::UnexpectedResponse {
-            message: format!("cannot decode the repo list: {e}"),
+            message: truncate(&format!("cannot decode the repo list: {e}"), secret),
         })?;
-    wire.into_iter().map(Repo::try_from).collect()
+    wire.into_iter()
+        .map(|repo| repo_from_wire(repo, secret))
+        .collect()
 }
 
 /// A repo as GitHub's JSON spells it (only the fields we use).
@@ -25,24 +28,20 @@ struct WireRepo {
     archived: bool,
 }
 
-impl TryFrom<WireRepo> for Repo {
-    type Error = Error;
-
-    fn try_from(wire: WireRepo) -> Result<Self> {
-        let name = wire
-            .full_name
-            .parse::<RepoName>()
-            .map_err(|_| Error::UnexpectedResponse {
-                message: format!("invalid repo name `{}`", wire.full_name),
-            })?;
-        Ok(Repo {
-            name,
-            description: wire.description.filter(|d| !d.is_empty()),
-            private: wire.private,
-            fork: wire.fork,
-            archived: wire.archived,
-        })
-    }
+fn repo_from_wire(wire: WireRepo, secret: &str) -> Result<Repo> {
+    let name = wire
+        .full_name
+        .parse::<RepoName>()
+        .map_err(|_| Error::UnexpectedResponse {
+            message: truncate(&format!("invalid repo name `{}`", wire.full_name), secret),
+        })?;
+    Ok(Repo {
+        name,
+        description: wire.description.filter(|d| !d.is_empty()),
+        private: wire.private,
+        fork: wire.fork,
+        archived: wire.archived,
+    })
 }
 
 #[cfg(test)]
@@ -57,7 +56,7 @@ mod tests {
 
     #[test]
     fn decodes_the_documented_example() {
-        let repos = decode_repos(DOCS_EXAMPLE.as_bytes()).unwrap();
+        let repos = decode_repos(DOCS_EXAMPLE.as_bytes(), "").unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].name.to_string(), "octocat/Hello-World");
         assert_eq!(
@@ -74,7 +73,7 @@ mod tests {
             {"full_name":"a/y","description":"","private":false,"fork":true,"archived":true},
             {"full_name":"a/z","private":false,"fork":false,"archived":false}
         ]"#;
-        let repos = decode_repos(body.as_bytes()).unwrap();
+        let repos = decode_repos(body.as_bytes(), "").unwrap();
         assert_eq!(repos.len(), 3);
         assert!(repos[0].private && repos[0].description.is_none());
         assert!(repos[1].fork && repos[1].archived && repos[1].description.is_none());
@@ -82,8 +81,48 @@ mod tests {
     }
 
     #[test]
+    fn network_texts_in_errors_are_truncated() {
+        let long = "é".repeat(10_000);
+        let bodies = [
+            format!(
+                r#"[{{"full_name":"a/x","description":null,"private":"{long}","fork":false,"archived":false}}]"#
+            ),
+            format!(r#"[{{"full_name":"{long}","private":false,"fork":false,"archived":false}}]"#),
+        ];
+        for body in bodies {
+            match decode_repos(body.as_bytes(), "") {
+                Err(Error::UnexpectedResponse { message }) => {
+                    assert!(
+                        message.chars().count() <= 300,
+                        "{}",
+                        message.chars().count()
+                    );
+                }
+                other => panic!("unexpected {:?}", other.map(|r| r.len())),
+            }
+        }
+    }
+
+    #[test]
+    fn the_secret_is_masked_before_the_cut() {
+        let secret = "ghp_secret";
+        // The message is "invalid repo name `<name>`": 19 characters before the name, so the secret starts 5 characters
+        // before the 300-character limit; cutting first would keep "ghp_s".
+        let name = format!("{}{secret}{}", "a".repeat(276), "b".repeat(50));
+        let body =
+            format!(r#"[{{"full_name":"{name}","private":false,"fork":false,"archived":false}}]"#);
+        match decode_repos(body.as_bytes(), secret) {
+            Err(Error::UnexpectedResponse { message }) => {
+                assert!(!message.contains("ghp"), "{message}");
+                assert_eq!(message.chars().count(), 300);
+            }
+            other => panic!("unexpected {:?}", other.map(|r| r.len())),
+        }
+    }
+
+    #[test]
     fn an_empty_page_is_an_empty_list() {
-        assert!(decode_repos(b"[]").unwrap().is_empty());
+        assert!(decode_repos(b"[]", "").unwrap().is_empty());
     }
 
     #[test]
@@ -99,7 +138,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decode_repos(bad.as_bytes()),
+                    decode_repos(bad.as_bytes(), ""),
                     Err(Error::UnexpectedResponse { .. })
                 ),
                 "{bad:?}"

@@ -33,8 +33,20 @@ d'exécution de l'interface, la forme du faux serveur et celle du harnais. Signa
 4. **Exécution** : tokio. `ghu::Ui<B: Backend>` ne fait jamais d'`await` réseau dans la boucle : chaque appel part
    dans une tâche tokio avec un clone du client, et son résultat revient par un canal, appliqué par
    `Ui::recv_background` (annulable, pour `tokio::select!`). Le clavier est lu par un thread OS dédié (crossterm
-   bloquant, poll de 200 ms). Une panique de tâche devient une erreur affichée. Le terminal est restauré par
-   `ratatui::init`/`restore` et son hook de panique.
+   bloquant, poll de 200 ms, thread `ghu-keyboard`). Une panique de tâche devient une erreur affichée
+   (`TaskFailed`) et ne touche pas au terminal. Messages à l'utilisateur : un par variante d'erreur
+   (`error_message`), jamais le `Display` de l'erreur.
+
+   **Terminal et paniques** (correctif de la relecture #2) : `terminal::run` n'appelle pas `ratatui::try_init`,
+   dont le hook de panique, global au processus, restaurerait le terminal même pour une panique de tâche tokio
+   rattrapée, l'interface continuant alors d'afficher sur un terminal déjà rendu. `run` active elle-même le mode
+   brut, l'écran alternatif et le bracketed paste, chaîne son hook devant le hook précédent et remet ce dernier en
+   sortant. Le hook ne restaure le terminal (`restore_terminal`, qui coupe aussi le bracketed paste) que si le
+   thread qui panique est marqué « thread d'interface » (`thread_local`) : le thread de `run` et le thread
+   `ghu-keyboard`. Ailleurs, seul le hook précédent s'exécute. La décision est une fonction pure testée,
+   `restore_if_ui(is_ui, restore)` (`crates/ghu/src/terminal.rs`). Contrainte : `run` reste sur un thread fixe
+   (`block_on` dans `main`), jamais dans une tâche tokio qui pourrait changer de thread.
+
 5. **Jeton et URL** : lus par `ghu::prepare` au travers du trait `ghu::Environment` (système en production,
    table en mémoire dans les tests : aucun test ne modifie l'environnement du processus, `unsafe` en 2024). Ordre :
    `GH_TOKEN`, `GITHUB_TOKEN`, sortie de `gh auth token` ; une valeur vide compte comme absente. Sans jeton ou
@@ -67,6 +79,19 @@ d'exécution de l'interface, la forme du faux serveur et celle du harnais. Signa
 
 ## Conséquences
 
+- **Erreurs et pannes posées dès #2** (relecture Spec du ticket #2) : `gh_client::Error` garde ses variantes
+  `InvalidRepoName`, `RateLimited`, `Forbidden`, `NotFound`, `Unprocessable`, et `gh_fake::FailureResponse`
+  ses pannes 403, 403 de limite, 404, 422 et 500, bien que #2 ne les affiche pas toutes. Elles servent #4, #8 et
+  #10 ; `Error` étant `#[non_exhaustive]`, les ajouter plus tard ne casserait rien, mais les retirer puis les
+  remettre coûterait deux passes de client, faux serveur et tests, pour une classification HTTP déjà testée en
+  unitaire (`crates/gh-client/src/status.rs`). Option écartée : les retirer jusqu'au ticket qui les affiche
+  (surface plus petite, mais travail refait). Reviendrait si une variante restait sans usage après #10.
+- **429** : toute réponse 429 est `Error::RateLimited` (`reset_at` lu dans `x-ratelimit-reset` s'il est un
+  nombre, sinon `None` ; `retry-after` n'est pas converti, faute d'horloge dans la classification). 429 veut dire
+  « trop de requêtes » quel que soit son corps, et l'interface doit proposer d'attendre, pas afficher une erreur
+  générique. Le 403 reste classé par son marqueur (`x-ratelimit-remaining: 0` ou message de limite secondaire).
+  À appliquer par dev[client] : `classify` de `status.rs` et son test `a_429_without_marker_is_a_plain_api_error`
+  (qui devient `RateLimited { reset_at: None }`), avec la doc de `Error::RateLimited` (`error.rs`).
 - Existant : aucun code livré avant cette ADR ; rien ne change pour les docs.
 - Chaque ticket suivant ajoute une méthode à `Client`, une route et des champs à `gh_fake::State`, un écran à
   `ghu`, et ses tests au harnais, sans changer ces signatures (types `#[non_exhaustive]`, `Context` opaque).

@@ -9,10 +9,8 @@
 //!    Tests instead build a [`Ui`] on ratatui's `TestBackend`, send it [`Input`]s and read the screen, against the
 //!    fake GitHub server (`gh-fake`) in real HTTP.
 //!
-//! Key map (every screen; a text field, from ticket #8, keeps letters for itself):
-//! `q` quit · `Ctrl-C` quit, always · `Esc` back (closes help or an overlay; does nothing on the first screen) ·
-//! `?` toggle the key help · `j`/`k` or `↓`/`↑` move · `Enter` open · `r` refresh (from ticket #3) ·
-//! `/` filter (from ticket #3).
+//! Key map (the table is `ui/keys.rs`, shown by the `?` help): `q` quit · `Ctrl-C` quit · `Esc` close the help ·
+//! `?` toggle the key help.
 
 mod env;
 mod launch;

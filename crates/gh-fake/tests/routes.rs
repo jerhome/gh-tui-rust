@@ -185,6 +185,23 @@ async fn pagination_uses_absolute_link_header() {
 }
 
 #[tokio::test]
+async fn affiliation_with_control_characters_is_encoded_in_the_link_header() {
+    let fake = start(five_repos()).await;
+    fake.with_state(|s| s.max_per_page = 2);
+
+    let resp = get(
+        &fake,
+        "/user/repos?affiliation=owner,%0A%C3%A9",
+        Some(DEFAULT_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let link = header(&resp, "link");
+    assert!(link.contains("affiliation=owner,%0A%C3%A9&"), "{link}");
+    assert!(link.is_ascii() && !link.contains('\n'), "{link:?}");
+}
+
+#[tokio::test]
 async fn per_page_default_is_30_and_capped_by_max_per_page() {
     let repos: Vec<Repo> = (0..40)
         .map(|i| Repo::new("alice", &format!("r{i:02}")))

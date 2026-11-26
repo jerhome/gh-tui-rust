@@ -708,7 +708,6 @@ dependencies = [
 name = "ghu"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "gh-client",
  "gh-fake",

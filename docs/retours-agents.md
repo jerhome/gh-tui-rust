@@ -24,3 +24,14 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   a manqué : **un essai a lancé le vrai `gh` (PATH=/usr/bin:/bin) et lu le vrai jeton** ; arrêt avant toute requête,
   mais à prévenir (piste pour la fiche dev ou un hook : jamais de `gh` réel ni de jeton réel dans les essais ; PATH
   sans `gh`, GH_TOKEN factice). Essai en Python (pseudo-terminal) alors que la règle est le maximum en Rust.
+- 2026-11-26 16:29 — qa (sonnet) — #2 : vérification + critères d'acceptation — a marché : table critère → tests, 5 tests
+  ajoutés, écarts de manifeste signalés sans corriger ; ~2 min — a manqué : pas de contre-épreuve de ses 5 tests.
+- 2026-11-26 16:29 — relecteur ×2 (opus) — #2 : code-review Standards / Spec en parallèle sans compiler — a marché :
+  Spec a trouvé le seul majeur (hook de panique de ratatui, vérifié dans le code de la dépendance), Standards 9 mineurs
+  précis avec scénario ; ~1,5 min chacun — a manqué : rien.
+- 2026-11-26 16:29 — dev ×3 (sonnet) + architecte (opus) — #2 : corrections en parallèle, `cargo fmt -p`, target partagé
+  — a marché : fichiers disjoints, aucun conflit, chaque dev signale ses points ouverts (masquer avant tronquer) ;
+  architecte corrige ses propres hypothèses après le rapport du dev — a manqué : **aucun dev n'a vu ses nouveaux tests
+  rouges** (tdd non suivi) ; un test de dev[client] était faux (passait sans le correctif), trouvé par la
+  contre-épreuve de qa. Piste pour la fiche dev : contre-épreuve obligatoire de chaque nouveau test ; pour la fiche
+  qa : contre-épreuve systématique des tests des dev.

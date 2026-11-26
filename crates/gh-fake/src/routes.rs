@@ -78,17 +78,34 @@ async fn not_found() -> Response {
     message(StatusCode::NOT_FOUND, RATE_LIMIT - 1, "Not Found")
 }
 
-/// Token after `Bearer ` or `token `; `Err(())`-like `None` inside means a header we cannot read.
-fn parse_authorization(headers: &HeaderMap) -> (bool, Option<String>) {
+/// What the `Authorization` header carries.
+enum Credentials {
+    /// No header at all.
+    Missing,
+    /// A header that is not `Bearer <token>` / `token <token>` (or not readable text).
+    Unusable,
+    Token(String),
+}
+
+impl Credentials {
+    fn token(&self) -> Option<&str> {
+        match self {
+            Self::Token(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+fn parse_authorization(headers: &HeaderMap) -> Credentials {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return (false, None);
+        return Credentials::Missing;
     };
     let token = value.to_str().ok().and_then(|v| {
         v.strip_prefix("Bearer ")
             .or_else(|| v.strip_prefix("token "))
             .map(str::to_owned)
     });
-    (true, token)
+    token.map_or(Credentials::Unusable, Credentials::Token)
 }
 
 async fn pipeline(AxState(app): AxState<App>, req: Request, next: Next) -> Response {
@@ -112,24 +129,24 @@ async fn pipeline(AxState(app): AxState<App>, req: Request, next: Next) -> Respo
     let bytes = to_bytes(body, RECORDED_BODY_LIMIT)
         .await
         .unwrap_or_default();
-    let (has_header, token) = parse_authorization(&parts.headers);
+    let credentials = parse_authorization(&parts.headers);
     let path = parts.uri.path().to_owned();
     app.lock().requests.push(RecordedRequest {
         method,
         path: path.clone(),
         query: parts.uri.query().map(str::to_owned),
-        token: token.clone(),
+        token: credentials.token().map(str::to_owned),
         body: serde_json::from_slice(&bytes).ok(),
     });
     let req = Request::from_parts(parts, Body::from(bytes));
 
     // 3. Authentication.
-    let accepted = token.is_some_and(|t| t == app.lock().token);
+    let accepted = credentials.token().is_some_and(|t| t == app.lock().token);
     if !accepted {
-        let text = if has_header {
-            "Bad credentials"
-        } else {
+        let text = if matches!(credentials, Credentials::Missing) {
             "Requires authentication"
+        } else {
+            "Bad credentials"
         };
         return message(StatusCode::UNAUTHORIZED, RATE_LIMIT, text);
     }
@@ -226,11 +243,32 @@ fn access_matches(access: Access, affiliation: &str) -> bool {
     affiliation.split(',').any(|a| a.trim() == wanted)
 }
 
+/// Pagination facts needed to build the `Link` header once the state lock is released.
+struct Page {
+    per_page: usize,
+    page: usize,
+    last: usize,
+    affiliation: Option<String>,
+}
+
+/// Percent-encodes everything but URL-unreserved characters, so any decoded query value is header-safe.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b',') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 async fn user_repos(
     AxState(app): AxState<App>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let (body, max_per_page) = {
+    let (body, paging) = {
         let state = app.lock();
         let affiliation = query
             .get("affiliation")
@@ -262,14 +300,24 @@ async fn user_repos(
             .collect();
         (
             items,
-            (per_page, page, last, query.get("affiliation").cloned()),
+            Page {
+                per_page,
+                page,
+                last,
+                affiliation: query.get("affiliation").cloned(),
+            },
         )
     };
-    let (per_page, page, last, affiliation) = max_per_page;
+    let Page {
+        per_page,
+        page,
+        last,
+        affiliation,
+    } = paging;
     let url = |p: usize| {
         let mut u = format!("http://{}/user/repos?", app.addr);
         if let Some(a) = &affiliation {
-            u.push_str(&format!("affiliation={a}&"));
+            u.push_str(&format!("affiliation={}&", percent_encode(a)));
         }
         u.push_str(&format!("per_page={per_page}&page={p}"));
         u

@@ -4,6 +4,7 @@ description = "GitHub REST v3 client used by ghu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]

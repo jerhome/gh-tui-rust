@@ -11,11 +11,15 @@ const MAX_MESSAGE_CHARS: usize = 300;
 /// Classifies a non-2xx answer (ticket #2: 401, 403, 429, 404, 422, anything else).
 ///
 /// - 401: [`Error::Unauthorized`].
-/// - 403 or 429 with `x-ratelimit-remaining: 0`, or whose message mentions a secondary rate limit:
-///   [`Error::RateLimited`] with `x-ratelimit-reset` when it is a number.
-/// - other 403: [`Error::Forbidden`]; 404: [`Error::NotFound`]; 422: [`Error::Unprocessable`]; the rest, including a
-///   429 without a rate-limit marker: [`Error::Api`].
-pub(crate) fn classify(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> Error {
+/// - any 429: [`Error::RateLimited`]; a 403 with `x-ratelimit-remaining: 0`, or whose message mentions a secondary
+///   rate limit, too. `reset_at` is `x-ratelimit-reset` when it is a number, else `None` (`retry-after` is ignored).
+/// - other 403: [`Error::Forbidden`]; 404: [`Error::NotFound`]; 422: [`Error::Unprocessable`]; the rest: [`Error::Api`].
+pub(crate) fn classify(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+    secret: &str,
+) -> Error {
     let json: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
     let message = json
         .get("message")
@@ -23,19 +27,22 @@ pub(crate) fn classify(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> 
         .unwrap_or_default();
     match status.as_u16() {
         401 => Error::Unauthorized,
-        403 | 429 if is_rate_limited(headers, message) => Error::RateLimited {
+        429 => Error::RateLimited {
+            reset_at: header_u64(headers, "x-ratelimit-reset"),
+        },
+        403 if is_rate_limited(headers, message) => Error::RateLimited {
             reset_at: header_u64(headers, "x-ratelimit-reset"),
         },
         403 => Error::Forbidden {
-            message: truncate(message),
+            message: truncate(message, secret),
         },
         404 => Error::NotFound,
         422 => Error::Unprocessable {
-            message: truncate(&unprocessable_message(&json, message)),
+            message: truncate(&unprocessable_message(&json, message), secret),
         },
         code => Error::Api {
             status: code,
-            message: truncate(message),
+            message: truncate(message, secret),
         },
     }
 }
@@ -70,7 +77,16 @@ fn unprocessable_message(json: &serde_json::Value, message: &str) -> String {
         .join("; ")
 }
 
-fn truncate(message: &str) -> String {
+/// `message` with `secret` masked, then cut to [`MAX_MESSAGE_CHARS`] characters (texts that come from the network).
+/// Masking comes first so that the cut can never leave a fragment of the secret.
+pub(crate) fn truncate(message: &str, secret: &str) -> String {
+    let masked;
+    let message = if secret.is_empty() {
+        message
+    } else {
+        masked = message.replace(secret, "***");
+        &masked
+    };
     message.chars().take(MAX_MESSAGE_CHARS).collect()
 }
 
@@ -107,6 +123,8 @@ mod tests {
     use super::{classify, redact};
     use crate::Error;
 
+    const SECRET: &str = "ghp_secret";
+
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (name, value) in pairs {
@@ -123,6 +141,7 @@ mod tests {
             StatusCode::from_u16(status).unwrap(),
             &headers(pairs),
             body.as_bytes(),
+            SECRET,
         )
     }
 
@@ -202,12 +221,19 @@ mod tests {
     }
 
     #[test]
-    fn a_429_without_marker_is_a_plain_api_error() {
+    fn a_429_without_marker_is_rate_limited_without_reset() {
         assert_eq!(
             run(429, &[], r#"{"message":"Slow down"}"#),
-            Error::Api {
-                status: 429,
-                message: "Slow down".into()
+            Error::RateLimited { reset_at: None }
+        );
+        assert_eq!(
+            run(429, &[("retry-after", "60")], ""),
+            Error::RateLimited { reset_at: None }
+        );
+        assert_eq!(
+            run(429, &[("x-ratelimit-reset", "1893456000")], ""),
+            Error::RateLimited {
+                reset_at: Some(1_893_456_000)
             }
         );
     }
@@ -263,6 +289,24 @@ mod tests {
         let body = format!(r#"{{"message":"{}"}}"#, "é".repeat(10_000));
         match run(500, &[], &body) {
             Error::Api { message, .. } => assert_eq!(message.chars().count(), 300),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_secret_is_masked_before_the_cut() {
+        // The secret starts 5 characters before the 300-character limit: cutting first would keep "ghp_s".
+        let body = format!(
+            r#"{{"message":"{}{SECRET}{}"}}"#,
+            "a".repeat(295),
+            "b".repeat(50)
+        );
+        match run(500, &[], &body) {
+            Error::Api { message, .. } => {
+                assert!(!message.contains("ghp"), "{message}");
+                assert_eq!(message.chars().count(), 300);
+                assert!(message.ends_with("***bb"));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

@@ -35,11 +35,12 @@ pub enum Error {
     /// HTTP 401: the token is invalid, expired or revoked.
     #[error("GitHub rejected the token (401)")]
     Unauthorized,
-    /// HTTP 403 or 429 with `x-ratelimit-remaining: 0` (primary limit), or a 403/429 whose message mentions a
+    /// Any HTTP 429, or an HTTP 403 with `x-ratelimit-remaining: 0` (primary limit) or whose message mentions a
     /// secondary rate limit.
     #[error("GitHub rate limit exceeded")]
     RateLimited {
-        /// When the limit resets, in seconds since the Unix epoch (`x-ratelimit-reset`), if GitHub said so.
+        /// When the limit resets, in seconds since the Unix epoch (`x-ratelimit-reset`), if GitHub said so
+        /// (`x-ratelimit-reset` is numeric); `retry-after` is not converted.
         reset_at: Option<u64>,
     },
     /// HTTP 403 that is not a rate limit: missing rights or scope.

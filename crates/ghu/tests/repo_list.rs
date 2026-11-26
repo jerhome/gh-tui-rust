@@ -4,7 +4,7 @@ mod support;
 
 use std::time::Duration;
 
-use gh_fake::{Failure, FailureResponse, Method, State};
+use gh_fake::{Access, Failure, FailureResponse, Method, Repo, State};
 use ghu::{KeyCode, KeyModifiers};
 use support::Harness;
 
@@ -138,4 +138,73 @@ async fn a_token_refused_by_the_server_also_shows_the_message() {
     })
     .await;
     app.wait_for("GitHub rejected the token").await;
+}
+
+fn failing(response: FailureResponse) -> State {
+    let mut state = State::demo();
+    state.failures.push(Failure {
+        method: Method::Get,
+        path: "/user/repos".into(),
+        response,
+        remaining: None,
+    });
+    state
+}
+
+#[tokio::test]
+async fn an_empty_account_shows_no_repos() {
+    let mut state = State::demo();
+    state.repos.clear();
+    let mut app = Harness::start(state).await;
+    app.wait_for("No repos.").await;
+    assert!(!app.screen().contains("Loading"), "{}", app.screen());
+}
+
+#[tokio::test]
+async fn a_server_error_shows_a_message_and_not_the_token_message() {
+    let mut app = Harness::start(failing(FailureResponse::ServerError)).await;
+    app.wait_for("Cannot load the repos").await;
+    let screen = app.screen();
+    assert!(!screen.contains("rejected the token"), "{screen}");
+    assert!(!screen.contains("Loading"), "{screen}");
+    app.press(KeyCode::Char('q'));
+    assert!(app.is_finished());
+}
+
+#[tokio::test]
+async fn a_rate_limit_shows_a_message() {
+    let mut app = Harness::start(failing(FailureResponse::RateLimited)).await;
+    app.wait_for("Cannot load the repos").await;
+    assert!(
+        !app.screen().contains("rejected the token"),
+        "{}",
+        app.screen()
+    );
+}
+
+#[tokio::test]
+async fn only_the_users_own_repos_are_listed() {
+    let mut state = State::demo();
+    let mut other = Repo::new("bob", "shared-project");
+    other.access = Access::Collaborator;
+    state.repos.push(other);
+    let mut app = Harness::start(state).await;
+    app.wait_for("alice/notes").await;
+    assert!(
+        !app.screen().contains("bob/shared-project"),
+        "{}",
+        app.screen()
+    );
+}
+
+#[tokio::test]
+async fn every_page_of_repos_is_loaded() {
+    let mut state = State::demo();
+    state.max_per_page = 1;
+    let mut app = Harness::start(state).await;
+    app.settle().await;
+    let screen = app.screen();
+    for repo in ["alice/dotfiles", "alice/notes", "alice/secret-garden"] {
+        assert!(screen.contains(repo), "{repo} missing:\n{screen}");
+    }
 }

@@ -4,6 +4,7 @@ description = "Fake GitHub REST server (loopback only) for ghu tests and demos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 # Depends on no other crate of the workspace on purpose: its JSON is written from GitHub's documentation,

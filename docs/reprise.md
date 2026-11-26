@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-26 17:12.
+Mis à jour le 2026-11-26 17:27.
 
 ## État
 
@@ -14,14 +14,18 @@ Mis à jour le 2026-11-26 17:12.
 
 ## Prochaine action
 
-Tickets #3, #4, #5 fermés (3e7c5f9, poussé). **CI rouge sur macOS** : test
-`an_invalid_file_at_start_up_shows_a_notice_and_refuses_pinning` (pinned_repos.rs:354), écran sans « is invalid » ;
-hypothèse : chemin temporaire macOS long qui pousse le texte hors des 100 colonnes du harnais (test fragile).
+Fermés : #2, #3, #4, #5, #11 (5 sur 10). main = cc81eb6, poussé (correctif macOS : message des Pinned repos avec le
+problème avant le chemin ; CI à vérifier). ADR 0003 (#6 à #10) écrite, statut « proposée ».
 
-1. Corriger ce test (dev[tui] ou qa), CI verte.
-2. ADR 0003 (#6 à #10) écrite, statut « proposée » : relecture (relecteur), acceptation, puis vague 0 (architecte),
-   dev[fake] + dev[client], dev[tui-detail], etc. (ordre dans l'ADR).
-3. Rétro n° 3 d'agents-home le 2026-11-26 vers 17:20 (questionnaire : <https://claude.ai/artifact/T3kijTUKyZ8wNZfNckNzHA>).
+1. Vérifier la CI de cc81eb6 (run 45858919724).
+2. Relecture de l'ADR 0003 (relecteur opus, axe Spec contre #6-#10 + compatibilité avec l'ADR 0002 amendée :
+   Shared::push, Flow::Pop retiré), amendements, acceptation.
+3. Vague 0 (architecte : signatures dans crates/), puis dev[fake] + dev[client], puis #6 (dev[tui-detail]) ;
+   ordre complet dans l'ADR 0003. Règles de la rétro n° 3 : tests vus rouges + contre-épreuves, fmt -p, mutations de
+   qa dans un worktree avec son propre target, 3e tour de relecture = bloquants et majeurs seulement.
+4. Finir #6, puis écrire deux skills locaux dans ce repo (rétro n° 3) : retro (fusion avec celle de mattpocock) et
+   handoff (écrit dans docs/reprise.md au lieu de /tmp).
+5. Essai sccache (décision de la rétro n° 3).
 
 ## Points ouverts
 

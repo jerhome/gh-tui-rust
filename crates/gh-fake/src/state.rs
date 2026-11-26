@@ -28,13 +28,35 @@ pub struct State {
 impl State {
     /// An empty state for `user`: token [`crate::DEFAULT_TOKEN`], no repo, no latency, `max_per_page` 100.
     pub fn new(user: User) -> Self {
-        todo!()
+        Self {
+            token: crate::DEFAULT_TOKEN.to_owned(),
+            user,
+            repos: Vec::new(),
+            latency: Duration::ZERO,
+            max_per_page: 100,
+            failures: Vec::new(),
+            requests: Vec::new(),
+        }
     }
 
     /// Demo data (also used by the `gh-fake` binary): user `alice` (id 1) owning at least three repos, one of
     /// them a fork, one archived, one private with a description. Fictional names only.
     pub fn demo() -> Self {
-        todo!()
+        let mut state = Self::new(User {
+            login: "alice".into(),
+            id: 1,
+        });
+        let mut notes = Repo::new("alice", "notes");
+        notes.description = Some("Plain-text notes and snippets".into());
+        let mut garden = Repo::new("alice", "secret-garden");
+        garden.description = Some("Private plans for the garden".into());
+        garden.private = true;
+        let mut dotfiles = Repo::new("alice", "dotfiles");
+        dotfiles.fork = true;
+        let mut old = Repo::new("alice", "old-experiments");
+        old.archived = true;
+        state.repos = vec![notes, garden, dotfiles, old];
+        state
     }
 }
 
@@ -69,7 +91,15 @@ pub struct Repo {
 impl Repo {
     /// A public, non-fork, non-archived repo without description, owned by the user ([`Access::Owner`]).
     pub fn new(owner: &str, name: &str) -> Self {
-        todo!()
+        Self {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            private: false,
+            fork: false,
+            archived: false,
+            access: Access::Owner,
+        }
     }
 }
 

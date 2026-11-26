@@ -17,6 +17,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "tim
 
 [dev-dependencies]
 reqwest = { workspace = true }
+# reqwest is built with rustls-no-provider: tests install the ring provider themselves.
+rustls = { workspace = true }
 
 [[bin]]
 name = "gh-fake"

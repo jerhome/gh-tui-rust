@@ -28,7 +28,6 @@ pub use state::{Access, Failure, FailureResponse, Method, RecordedRequest, Repo,
 pub const DEFAULT_TOKEN: &str = "ghu-fake-token";
 
 /// A running fake server. Dropping it stops the server (the task is aborted; in-flight requests are cut).
-#[allow(dead_code)]
 pub struct FakeGitHub {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -40,22 +39,30 @@ impl FakeGitHub {
     ///
     /// Errors: the `std::io::Error` of binding the port.
     pub async fn start(state: State) -> std::io::Result<Self> {
-        todo!()
+        Self::start_on(0, state).await
     }
 
     /// Like [`FakeGitHub::start`] on a given port (`0` = chosen by the OS); used by the `gh-fake` binary.
     pub async fn start_on(port: u16, state: State) -> std::io::Result<Self> {
-        todo!()
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let addr = listener.local_addr()?;
+        let state = Arc::new(Mutex::new(state));
+        let app = routes::router(Arc::clone(&state), addr);
+        let task = tokio::spawn(async move {
+            // The task ends when aborted by `Drop`; a serve error has nobody to report to.
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self { addr, state, task })
     }
 
     /// The address the server listens on (always loopback).
     pub fn addr(&self) -> SocketAddr {
-        todo!()
+        self.addr
     }
 
     /// The URL to give `ghu` as `GHU_API_URL`: `http://127.0.0.1:<port>`, without trailing `/`.
     pub fn base_url(&self) -> String {
-        todo!()
+        format!("http://{}", self.addr)
     }
 
     /// Runs `f` on the live state (lock held during `f` only; do not `.await` inside). Changes apply to the next
@@ -63,18 +70,22 @@ impl FakeGitHub {
     ///
     /// Panics: never on a poisoned lock (the poison is ignored).
     pub fn with_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        todo!()
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
     }
 
     /// A copy of the requests received so far, oldest first (same as `with_state(|s| s.requests.clone())`).
     pub fn requests(&self) -> Vec<RecordedRequest> {
-        todo!()
+        self.with_state(|s| s.requests.clone())
     }
 }
 
 impl Drop for FakeGitHub {
     /// Aborts the server task.
     fn drop(&mut self) {
-        todo!()
+        self.task.abort();
     }
 }

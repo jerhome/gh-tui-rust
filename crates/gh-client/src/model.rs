@@ -19,7 +19,28 @@ pub struct RepoName {
 impl RepoName {
     /// Builds a repo name from its two parts. Errors: [`Error::InvalidRepoName`].
     pub fn new(owner: &str, name: &str) -> Result<Self, Error> {
-        todo!()
+        let owner_ok = (1..=39).contains(&owner.len())
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !owner.starts_with('-')
+            && !owner.ends_with('-');
+        let name_ok = (1..=100).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            && name != "."
+            && name != "..";
+        if owner_ok && name_ok {
+            Ok(Self {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+            })
+        } else {
+            Err(Error::InvalidRepoName {
+                input: format!("{owner}/{name}"),
+            })
+        }
     }
 
     /// The owner (user or organization login).
@@ -39,14 +60,21 @@ impl FromStr for RepoName {
     /// Parses `owner/name` (surrounding whitespace ignored, exactly one `/`). Errors: [`Error::InvalidRepoName`]
     /// carrying the input as typed.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        todo!()
+        let invalid = || Error::InvalidRepoName {
+            input: s.to_owned(),
+        };
+        let (owner, name) = s.trim().split_once('/').ok_or_else(invalid)?;
+        if name.contains('/') {
+            return Err(invalid());
+        }
+        Self::new(owner, name).map_err(|_| invalid())
     }
 }
 
 impl fmt::Display for RepoName {
     /// `owner/name`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        write!(f, "{}/{}", self.owner, self.name)
     }
 }
 
@@ -77,4 +105,93 @@ pub struct Repo {
     pub fork: bool,
     /// Archived repo: read-only (glossary: Archived repo).
     pub archived: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RepoName;
+    use crate::Error;
+
+    fn invalid(owner: &str, name: &str) {
+        assert!(
+            matches!(
+                RepoName::new(owner, name),
+                Err(Error::InvalidRepoName { .. })
+            ),
+            "{owner:?}/{name:?} should be refused"
+        );
+    }
+
+    #[test]
+    fn parses_owner_and_name() {
+        let repo: RepoName = "jerhome/gh-tui-rust".parse().unwrap();
+        assert_eq!(repo.owner(), "jerhome");
+        assert_eq!(repo.name(), "gh-tui-rust");
+        assert_eq!(repo.to_string(), "jerhome/gh-tui-rust");
+    }
+
+    #[test]
+    fn parse_ignores_surrounding_whitespace_and_keeps_case() {
+        let repo: RepoName = "  Octo-Org/Hello.World_1\n".parse().unwrap();
+        assert_eq!(repo.to_string(), "Octo-Org/Hello.World_1");
+    }
+
+    #[test]
+    fn parse_refuses_a_missing_or_extra_slash_and_carries_the_input() {
+        for bad in [
+            "",
+            "alice",
+            "/repo",
+            "alice/",
+            "a/b/c",
+            "alice /repo",
+            "alice/re po",
+        ] {
+            assert_eq!(
+                bad.parse::<RepoName>(),
+                Err(Error::InvalidRepoName {
+                    input: bad.to_owned()
+                }),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_length_bounds_are_1_and_39() {
+        assert!(RepoName::new(&"a".repeat(39), "r").is_ok());
+        assert!(RepoName::new("a", "r").is_ok());
+        invalid(&"a".repeat(40), "r");
+        invalid("", "r");
+    }
+
+    #[test]
+    fn name_length_bounds_are_1_and_100() {
+        assert!(RepoName::new("o", &"n".repeat(100)).is_ok());
+        assert!(RepoName::new("o", "n").is_ok());
+        invalid("o", &"n".repeat(101));
+        invalid("o", "");
+    }
+
+    #[test]
+    fn owner_hyphen_rules() {
+        assert!(RepoName::new("a-b", "r").is_ok());
+        invalid("-ab", "r");
+        invalid("ab-", "r");
+        invalid("a_b", "r");
+        invalid("a.b", "r");
+        invalid("é", "r");
+    }
+
+    #[test]
+    fn name_allows_dot_underscore_and_hyphen_but_not_dot_or_dotdot() {
+        for ok in [".github", "a.b", "a_b", "-a-", "...", "a..", "A1"] {
+            assert!(RepoName::new("o", ok).is_ok(), "{ok:?} should be accepted");
+        }
+        invalid("o", ".");
+        invalid("o", "..");
+        invalid("o", "a b");
+        invalid("o", "a/b");
+        invalid("o", "é");
+    }
 }

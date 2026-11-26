@@ -17,11 +17,12 @@ impl Token {
     /// Trims surrounding whitespace (including the trailing newline `gh` prints). Returns `None` if nothing is
     /// left, so an empty `GH_TOKEN=` counts as unset.
     pub fn new(raw: impl Into<String>) -> Option<Self> {
-        todo!()
+        let raw: String = raw.into();
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| Self(trimmed.to_owned()))
     }
 
     /// The secret value. Crate-private on purpose: only the HTTP layer may read it.
-    #[allow(dead_code)]
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
@@ -30,6 +31,38 @@ impl Token {
 impl fmt::Debug for Token {
     /// Always `Token(***)`, whatever the value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        f.write_str("Token(***)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Token;
+
+    #[test]
+    fn new_trims_surrounding_whitespace_and_newline() {
+        let token = Token::new("  ghp_abc123\n").expect("non-empty token");
+        assert_eq!(token.expose(), "ghp_abc123");
+    }
+
+    #[test]
+    fn new_keeps_a_plain_value_unchanged() {
+        assert_eq!(
+            Token::new("ghp_abc123").expect("token").expose(),
+            "ghp_abc123"
+        );
+    }
+
+    #[test]
+    fn new_refuses_empty_and_blank_input() {
+        assert!(Token::new("").is_none());
+        assert!(Token::new("   \t\r\n").is_none());
+    }
+
+    #[test]
+    fn debug_never_shows_the_value() {
+        let token = Token::new("ghp_supersecret").expect("token");
+        assert_eq!(format!("{token:?}"), "Token(***)");
+        assert_eq!(format!("{token:#?}"), "Token(***)");
     }
 }

@@ -7,4 +7,7 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
 
 ## Journal
 
-(aucun lancement pour l'instant)
+- 2026-11-26 01:46 — architecte (opus) — #2 : ADR 0001, workspace, signatures, lots — a marché : contrat complet (3 crates,
+  signatures documentées, cargo check vert), options écartées chiffrées, lots avec tests TDD précis, ordre et
+  goulot nommés, tranche seul les choix réversibles (Q1 langue, défaut appliqué) ; ~10 min — a manqué : rien de
+  bloquant ; propose opus pour dev[tui] avec raison.

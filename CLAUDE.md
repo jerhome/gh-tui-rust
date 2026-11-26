@@ -31,11 +31,19 @@ Agents d'agents-home, lancés par leur nom depuis une session `cc`. Consigne de 
 | `relecteur` | opus | lecture seule ; d'office sur réseau, jeton, parsing des réponses de l'API, nouvelle dépendance |
 | `plateforme` | sonnet | `.github/`, `scripts/`, `Cargo.toml` racine (`[profile]`), release |
 
-Périmètres `dev` : **à fixer par l'ADR 0001** (découpage en crates). Proposition de départ, à confirmer :
+Périmètres `dev` (ADR 0001) :
 
-- `client` : `crates/gh-client` — API GitHub (REST/GraphQL), modèles serde, trait d'accès, erreurs typées.
-- `tui` : `crates/ghu` — binaire, interface ratatui/crossterm, écrans, raccourcis, confirmations.
-- `fake` : `crates/gh-fake` — faux serveur GitHub pour les tests et la démo.
+- `fake` : `crates/gh-fake/` — faux serveur GitHub (routes, état `State`, données de démo, binaire `gh-fake`)
+  et ses tests.
+- `client` : `crates/gh-client/` — routes REST v3, modèles publics, `Token`, `ApiBase`, `Error`, et ses tests
+  (unitaires, `tests/` contre `gh-fake`, fixtures JSON tirées de la doc GitHub).
+- `tui` : `crates/ghu/` — démarrage (`prepare`, `Environment`), interface (`Ui`, écrans, raccourcis, confirmations),
+  boucle terminal, binaire `ghu`, harnais `tests/support/` et tests de bout en bout.
+
+Dépendances : `ghu` → `gh-client` ; `gh-fake` ne dépend d'aucun crate du workspace et n'est que `dev-dependency`
+(de `ghu` et de `gh-client`). `Cargo.toml` racine (`[workspace.dependencies]`, lints), `Cargo.lock` et
+signatures publiques : `architecte` ; un `dev` qui a besoin d'une dépendance ou d'un changement de signature le
+demande dans son rapport.
 
 Ordre type d'une fonctionnalité : `architecte` (contrat, lots) → `dev` en parallèle (un par périmètre, fichiers
 disjoints) → `qa` → `relecteur` → session principale (commit avec accord). Boucle d'échec : CONVENTIONS.md § 6.

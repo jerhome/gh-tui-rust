@@ -5,7 +5,9 @@ Une question répondue est déplacée en bas avec sa réponse et sa date.
 
 ## En attente
 
-(aucune)
+- **Q1 (2026-11-26) — Langue de l'interface de `ghu`.** Le glossaire est en anglais et dit quels mots éviter « in UI
+  text » ; le repo est public. Changer de langue plus tard coûte la reprise des textes et des tests d'écran.
+  Recommandation : anglais. **Défaut appliqué : anglais** (textes d'écran, aide, messages d'erreur, `--help`).
 
 ## Répondues
 

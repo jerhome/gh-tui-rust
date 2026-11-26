@@ -1,0 +1,27 @@
+[package]
+name = "ghu"
+description = "Terminal client for GitHub: browse repos and pull requests, and review them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+gh-client = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+gh-fake = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[[bin]]
+name = "ghu"
+path = "src/main.rs"
+
+[lints]
+workspace = true

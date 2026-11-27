@@ -196,6 +196,38 @@ async fn changing_file_resets_the_scroll() {
 }
 
 #[tokio::test]
+async fn n_after_the_last_and_p_before_the_first_keep_the_scroll() {
+    let state = state_with(vec![
+        long_file("a.rs", "row", 100),
+        long_file("b.rs", "other", 100),
+    ]);
+    let mut app = open_diff(state).await;
+    app.wait_for("+row 001").await;
+    // Before the first file: nothing moves, so the scroll is kept.
+    press_times(&mut app, KeyCode::Char('j'), 10);
+    app.press(KeyCode::Char('p'));
+    let screen = app.screen();
+    assert!(
+        !screen.contains("+row 001") && screen.contains("+row 011"),
+        "p before the first reset the scroll: {screen}"
+    );
+    // After the last file: same.
+    app.press(KeyCode::Char('n'));
+    app.wait_for("+other 001").await;
+    press_times(&mut app, KeyCode::Char('j'), 10);
+    app.press(KeyCode::Char('n'));
+    let screen = app.screen();
+    assert!(
+        !screen.contains("+other 001") && screen.contains("+other 011"),
+        "n after the last reset the scroll: {screen}"
+    );
+    // The selection is still the last file: p goes to the first one.
+    app.press(KeyCode::Char('p'));
+    let screen = app.screen();
+    assert!(screen.contains("+row 001"), "{screen}");
+}
+
+#[tokio::test]
 async fn vertical_scroll_by_line_and_page_is_bounded() {
     let mut app = open_diff(state_with(vec![long_file("a.rs", "row", 100)])).await;
     app.wait_for("+row 001").await;
@@ -487,6 +519,15 @@ async fn a_hostile_previous_name_is_made_visible() {
     );
 }
 
+/// How many requests for the files of PR #1 the fake has answered.
+fn files_requests(app: &Harness) -> usize {
+    app.fake
+        .requests()
+        .iter()
+        .filter(|request| request.path.ends_with("/pulls/1/files"))
+        .count()
+}
+
 #[tokio::test]
 async fn a_slow_answer_to_an_older_request_does_not_overwrite_a_newer_one() {
     let mut app = open_detail(state_with(vec![file(
@@ -509,6 +550,13 @@ async fn a_slow_answer_to_an_older_request_does_not_overwrite_a_newer_one() {
         .with_state(|s| s.latency = std::time::Duration::ZERO);
     app.press(KeyCode::Char('r'));
     app.wait_for("+first content").await;
+    // The scenario needs the first request still waiting (a request is recorded once its latency is over): on a
+    // runner so slow that it has answered already, fail loudly rather than pass without testing anything.
+    assert_eq!(
+        files_requests(&app),
+        1,
+        "the first request answered before the data changed: the test did not reach its scenario"
+    );
     app.fake.with_state(|s| {
         s.pull_mut("alice", "notes", 1).expect("pr").files = vec![file(
             "a.rs",
@@ -519,6 +567,7 @@ async fn a_slow_answer_to_an_older_request_does_not_overwrite_a_newer_one() {
         )];
     });
     app.settle().await;
+    assert_eq!(files_requests(&app), 2, "the late answer was not received");
     let screen = app.screen();
     assert!(
         screen.contains("+first content") && !screen.contains("+second content"),

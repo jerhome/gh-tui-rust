@@ -4,7 +4,7 @@
 //! `str::lines()` (so `\n` and `\r\n` end a line) and drawn without wrapping, windowed by screen columns (a CJK
 //! character or an emoji takes two).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use gh_client::{FileChange, FileStatus, PrNumber, RepoName};
 use ratatui::Frame;
@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::keys::{self, Binding};
-use super::text::clean;
+use super::text::{clean, clusters};
 use super::{Flow, HelpRow, Outcome, RequestId, Shared, View, error_message};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -136,6 +136,18 @@ pub(crate) struct DiffScreen {
     max_hscroll: Cell<usize>,
     page: Cell<usize>,
     list_offset: Cell<usize>,
+    /// The size of the patch of one file (the index of the file, then its measure): measured once, not at every
+    /// frame. Emptied by every change of file or of data ([`Self::select`], [`Self::set_files`]).
+    measure: RefCell<Option<(usize, Measure)>>,
+}
+
+/// What a frame needs to know of a whole patch.
+#[derive(Clone, Copy)]
+struct Measure {
+    /// Number of lines.
+    lines: usize,
+    /// Columns of the longest line (once cleaned).
+    longest: usize,
 }
 
 impl DiffScreen {
@@ -159,6 +171,7 @@ impl DiffScreen {
             max_hscroll: Cell::new(0),
             page: Cell::new(0),
             list_offset: Cell::new(0),
+            measure: RefCell::new(None),
         }
     }
 
@@ -196,6 +209,7 @@ impl DiffScreen {
             .saturating_add_signed(step)
             .min(last);
         if next != self.selected {
+            self.measure.take();
             self.selected = next;
             self.scroll = 0;
             self.hscroll = 0;
@@ -230,6 +244,7 @@ impl DiffScreen {
                 self.hscroll = 0;
             }
         }
+        self.measure.take();
         self.load = Load::Loaded(files);
     }
 }
@@ -316,7 +331,7 @@ impl DiffScreen {
             Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(area);
         let selected = self.selected.min(files.len() - 1);
         self.render_list(frame, left, files, selected);
-        self.render_patch(frame, right, &files[selected]);
+        self.render_patch(frame, right, selected, &files[selected]);
     }
 
     fn render_list(
@@ -350,7 +365,25 @@ impl DiffScreen {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn render_patch(&self, frame: &mut Frame<'_>, area: Rect, file: &FileChange) {
+    /// The size of the patch of file `index`: measured by the first frame that draws it, then kept.
+    fn measure_of(&self, index: usize, patch: &str) -> Measure {
+        let mut cache = self.measure.borrow_mut();
+        match *cache {
+            Some((kept, measure)) if kept == index => measure,
+            _ => {
+                let (mut lines, mut longest) = (0_usize, 0_usize);
+                for line in patch.lines() {
+                    lines += 1;
+                    longest = longest.max(cols_of(&clean(line)));
+                }
+                let measure = Measure { lines, longest };
+                *cache = Some((index, measure));
+                measure
+            }
+        }
+    }
+
+    fn render_patch(&self, frame: &mut Frame<'_>, area: Rect, index: usize, file: &FileChange) {
         let block = Block::bordered();
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -373,13 +406,9 @@ impl DiffScreen {
             );
             return;
         };
-        let (mut count, mut longest) = (0_usize, 0_usize);
-        for line in patch.lines() {
-            count += 1;
-            longest = longest.max(cols_of(&clean(line)));
-        }
-        let max_scroll = count.saturating_sub(rows);
-        let max_hscroll = longest.saturating_sub(width);
+        let measure = self.measure_of(index, patch);
+        let max_scroll = measure.lines.saturating_sub(rows);
+        let max_hscroll = measure.longest.saturating_sub(width);
         self.max_scroll.set(max_scroll);
         self.max_hscroll.set(max_hscroll);
         let scroll = self.scroll.min(max_scroll);
@@ -464,15 +493,9 @@ fn patch_style(line: &str) -> Style {
     }
 }
 
-/// Screen columns taken by one character (0 for a combining mark, 2 for CJK and most emoji).
-fn char_cols(c: char) -> usize {
-    let mut buffer = [0; 4];
-    Span::raw(&*c.encode_utf8(&mut buffer)).width()
-}
-
-/// Screen columns taken by `text`.
+/// Screen columns taken by `text`, cluster by cluster (the one cutting rule of [`text::clusters`]).
 fn cols_of(text: &str) -> usize {
-    text.chars().map(char_cols).sum()
+    clusters(text).map(|(_, cols)| cols).sum()
 }
 
 /// `text` cut to at most `width` columns; when it does not fit, the last column holds `…`.
@@ -482,12 +505,11 @@ fn truncate_cols(text: &str, width: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars() {
-        let cols = char_cols(c);
+    for (cluster, cols) in clusters(text) {
         if used + cols + 1 > width {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         used += cols;
     }
     if width > 0 {
@@ -496,15 +518,14 @@ fn truncate_cols(text: &str, width: usize) -> String {
     out
 }
 
-/// The part of `text` from column `skip` on, at most `width` columns. A wide character cut by the left edge
-/// becomes spaces for its visible column (nothing is dropped without a trace); one that does not fit at the right
-/// edge is left out.
+/// The part of `text` from column `skip` on, at most `width` columns. A wide cluster cut by the left edge becomes
+/// spaces for its visible columns (nothing is dropped without a trace); one that does not fit at the right edge
+/// is left out.
 fn window_cols(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut position = 0;
     let mut used = 0;
-    for c in text.chars() {
-        let cols = char_cols(c);
+    for (cluster, cols) in clusters(text) {
         if position < skip {
             position += cols;
             if position > skip {
@@ -514,14 +535,10 @@ fn window_cols(text: &str, skip: usize, width: usize) -> String {
             }
             continue;
         }
-        if cols == 0 && out.is_empty() && skip > 0 {
-            // A combining mark whose base character was skipped.
-            continue;
-        }
         if used + cols > width {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         position += cols;
         used += cols;
     }
@@ -530,6 +547,7 @@ fn window_cols(text: &str, skip: usize, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::text::Rng;
     use super::*;
     use gh_client::{ApiBase, Client, Token};
     use gh_fake::{FakeGitHub, Pull, PullFile, Repo, State, User};
@@ -726,26 +744,82 @@ mod tests {
         assert_eq!(truncate_cols("日本語", 2), "…");
     }
 
-    /// A small deterministic generator (xorshift), as in the other modules.
-    fn generator(seed: u64) -> impl FnMut() -> usize {
-        let mut state = seed;
-        move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            usize::try_from(state % 1000).expect("small")
-        }
+    #[tokio::test]
+    async fn the_measure_of_the_patch_is_kept_until_the_file_changes() {
+        let mut screen = screen_with(vec![
+            patch_file("+one\n+two\n+three"),
+            PullFile::modified("b.rs", "+b"),
+        ])
+        .await;
+        draw(&screen, 100, 20);
+        let (index, measure) = screen
+            .measure
+            .borrow()
+            .expect("measured by the first frame");
+        assert_eq!((index, measure.lines, measure.longest), (0, 3, 6));
+        // Same file: the kept measure is used, not computed again (a marker put in the cache shows).
+        screen
+            .measure
+            .borrow_mut()
+            .as_mut()
+            .expect("cached")
+            .1
+            .lines = 500;
+        draw(&screen, 100, 20);
+        assert_eq!(screen.max_scroll.get(), 500 - screen.page.get());
+        // Another file, then new data: measured again.
+        screen.select(1);
+        assert!(screen.measure.borrow().is_none());
+        draw(&screen, 100, 20);
+        assert_eq!(screen.max_scroll.get(), 0);
+        screen
+            .measure
+            .borrow_mut()
+            .as_mut()
+            .expect("cached")
+            .1
+            .lines = 500;
+        let again = fetch(vec![
+            PullFile::modified("a.rs", "+a"),
+            PullFile::modified("b.rs", "+b\n+c"),
+        ])
+        .await;
+        screen.set_files(again);
+        assert!(screen.measure.borrow().is_none());
+        draw(&screen, 100, 20);
+        assert_eq!(screen.max_scroll.get(), 0);
+    }
+
+    #[test]
+    fn a_cluster_is_measured_and_cut_as_a_whole() {
+        let family = "👨\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let accent = "e\u{301}";
+        assert_eq!(cols_of(family), 2);
+        assert_eq!(cols_of(accent), 1);
+        assert_eq!(cols_of(&format!("a{family}b")), 4);
+        // The cluster fits whole, or is left out whole.
+        assert_eq!(
+            window_cols(&format!("a{family}b"), 0, 3),
+            format!("a{family}")
+        );
+        assert_eq!(window_cols(&format!("a{family}b"), 0, 2), "a");
+        assert_eq!(
+            truncate_cols(&format!("a{family}bc"), 4),
+            format!("a{family}…")
+        );
+        // Cut by the left edge: its visible columns become spaces, nothing of it is left.
+        assert_eq!(window_cols(&format!("{family}b"), 1, 3), " b");
     }
 
     #[test]
     fn column_helpers_never_overflow_their_width_nor_panic() {
         const POOL: [&str; 9] = ["a", "é", "日", "😀", " ", "\u{301}", "…", "\u{200d}", "x"];
-        let mut next = generator(0x2545_f491_4f6c_dd1d);
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         for _ in 0..2000 {
-            let text: String = (0..next() % 12)
-                .map(|_| POOL[next() % POOL.len()])
+            let text: String = (0..rng.below(12))
+                .map(|_| POOL[rng.below(POOL.len())])
                 .collect();
-            let (skip, width) = (next() % 16, next() % 16);
+            let (skip, width) = (rng.below(16), rng.below(16));
             assert!(
                 cols_of(&window_cols(&text, skip, width)) <= width,
                 "{text:?} {skip} {width}"

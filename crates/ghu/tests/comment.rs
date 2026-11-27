@@ -282,15 +282,6 @@ async fn wide_characters_are_shown_and_published_as_they_are() {
     );
 }
 
-#[tokio::test]
-async fn ctrl_e_has_no_effect_before_the_editor_lot() {
-    let mut app = compose().await;
-    app.type_text("ab");
-    app.press_with(KeyCode::Char('e'), KeyModifiers::CONTROL);
-    assert_on_screen(&mut app, HINT);
-    assert_eq!(publish_and_read_body(&mut app).await, "ab");
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Cancelling and refusing
 

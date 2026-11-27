@@ -10,6 +10,9 @@ Statut : **acceptée** (2026-11-27 11:45). Proposée le 2026-11-26 17:07, amend�
 **Amendée le 2026-11-27 (12:49)** d'après les relectures de #8 (Comment) : § 3 (`Signal::Kept`, `Draft`), § 4 (texte
 gardé après un échec, publication incertaine, touches de Confirm et de Publishing, titre `Files (<N>)` du Diff),
 lignes tui-compose et tui-review des Lots. Choix réversibles, internes à `ghu`.
+**Amendée le 2026-11-27 (16:01)** : 502 couvert en unitaire, harnais au 500 (§ 9, lignes tui-compose et
+tui-review des Lots) ; `Debug` d'`EditRequest` sans le texte (§ 5, § 7). Choix réversibles, sans code nouveau
+pour le 502.
 Les relectures de #3, #4 et #5 sont faites et commitées (3e7c5f9, cc81eb6) et l'ADR 0002 est acceptée : les
 anciens points « à confirmer après #3-#5 » sont tranchés d'après le code de `main` (fefff13) et remplacés ci-dessous
 par la décision confirmée.
@@ -661,6 +664,7 @@ celui de la zone, tel quel.
 pub(crate) struct EditorVars { pub(crate) visual: Option<String>, pub(crate) editor: Option<String> }
 
 /// A request to edit `text` in the user's editor, taken from Ui::take_edit. Send; owns its data.
+/// Debug (written by hand, § 9): vars, chars (length of the text) and the threshold; never the text.
 pub struct EditRequest { /* vars: EditorVars, text: String */ }
 
 impl EditRequest {
@@ -780,8 +784,8 @@ rien d'autre que son fichier.
   pas les redirections. Tests : le jeton n'apparaît ni à l'écran, ni dans les logs, ni dans les erreurs, pour une
   publication réussie et pour un 422 (extension de `tests/secrecy.rs` par le lot tui-review).
 - **Contenu publié** : uniquement le texte de la zone, après confirmation. Jamais journalisé : les logs donnent la
-  longueur (`MessageBody` a un `Debug` sans contenu). Le faux éditeur et le fichier temporaire ne contiennent que
-  ce texte ; le fichier est supprimé après lecture (`TempPath`), même en cas d'erreur.
+  longueur (`MessageBody`, `Draft` et `EditRequest` ont un `Debug` sans contenu). Le faux éditeur et le fichier
+  temporaire ne contiennent que ce texte ; le fichier est supprimé après lecture (`TempPath`), même en cas d'erreur.
 - **Échappement du terminal** : mesuré dans `ratatui-core` 0.1.2 (`buffer/buffer.rs:351`, `text/span.rs:314`) :
   les graphèmes qui contiennent un caractère de contrôle ne sont pas écrits, si bien qu'un `ESC` venu du réseau
   n'atteint pas le terminal. On ne s'en remet pas à ce détail interne : tout texte venu du réseau (titres, logins,
@@ -799,6 +803,40 @@ rien d'autre que son fichier.
 - `crates/ghu/Cargo.toml` : `[[bin]] name = "ghu-fake-editor"`, `path = "src/bin/fake_editor.rs"`, `test =
   false`, `doc = false`. Une future release ne doit empaqueter que `ghu`.
 - Aucun langage ajouté : le faux éditeur est en Rust.
+
+### 9. Amendement du 2026-11-27 (16:01) : 502 au harnais, `Debug` d'`EditRequest`
+
+**502 : couvert en unitaire, le harnais s'en tient au 500.** Les lignes tui-compose et tui-review des Lots
+demandaient « 500 et 502 au harnais » ; `FailureResponse` du faux n'a qu'un `ServerError` (500,
+`gh-fake/src/state.rs:509`) et les tests le disent (`ghu/tests/comment.rs:654`, `ghu/tests/review.rs:378`).
+Décision : on n'ajoute pas de 502 au faux. Raison, d'après le code : un 502 et un 500 suivent le même chemin à
+chaque étage. `status::classify` range tout code hors 401 / 403 / 404 / 422 / 429 dans le même bras
+`code => Error::Api { status: code, .. }` (`gh-client/src/status.rs:43`), et `uncertain` teste la plage
+`500..=599` (`ghu/src/ui/compose.rs:118`), déjà vérifiée en unitaire pour 500, 502, 599 et pour les bornes
+499 et 600 (`compose.rs:631`, test `uncertain_is_true_for_no_answer_unreadable_answer_and_5xx_only`). Lignes
+de e19f5f2. Un test 502 au harnais repasserait exactement par les lignes du test 500.
+
+- Couverture retenue : au harnais, 500 (Comment et Review) et réseau coupé → message « may have been published » ;
+  en unitaire, la plage 5xx d'`uncertain`. Les tests actuels respectent déjà ce contrat : rien à changer dans
+  `ghu` ni dans `gh-fake`.
+- Seul écart réel avec GitHub : un 502 de GitHub vient souvent de sa passerelle, avec un corps HTML et non JSON.
+  `classify` le lit par `serde_json::from_slice(..).unwrap_or_default()` (message vide), mais aucun test ne le
+  dit. Un test unitaire de plus dans `gh-client/src/status.rs` (module `tests`, aide `run` existante) :
+  `run(502, &[], "<html>…</html>")` donne `Error::Api { status: 502, message: "" }` ; et un 503 sans corps,
+  pareil. Lot `qa` de la version 0.1 (`docs/version-0.1.md`), pas de lot `dev`.
+- Option écartée : `FailureResponse::Status { status: u16, body: String }` dans le faux (lot dev[fake] + deux
+  tests au harnais) : une variante publique de plus à `gh-fake`, deux sessions (fake puis tui), pour un chemin
+  déjà couvert. On y revient si `ghu` se met à distinguer les 5xx entre eux (par exemple un renvoi sur 503), ou
+  si un essai réel montre un 5xx traité autrement qu'un 500.
+
+**`Debug` d'`EditRequest` sans le texte.** Constat de relecture de #9 : `ghu/src/editor.rs:33` dérive
+`Debug`, qui affiche le texte en cours d'édition ; `MessageBody` (`gh-client/src/model.rs:477`) et `Draft`
+(`ghu/src/ui.rs:158`) ont un `Debug` sans contenu (§ 7, « Contenu publié »). Contrat : `EditRequest` a un
+`impl fmt::Debug` écrit à la main qui donne `vars` (les commandes `VISUAL` / `EDITOR`, pas secrètes),
+`chars` (nombre de caractères du texte) et `returned_at_once`, jamais le texte. Test unitaire dans
+`editor.rs` : le `Debug` d'une requête sur `"secret draft"` ne contient pas `secret` et contient `chars: 12`.
+`EditorError` ne porte pas le texte (programme, code, message d'E/S) : rien à changer. Lot : dev[tui-editor],
+dans les corrections de #9 (fichier `editor.rs` de son périmètre).
 
 ## Options écartées
 
@@ -909,9 +947,9 @@ titres des écrans provisoires ; `Outcome::PrPage` porte un `Box<PrPage>` (clipp
 | 1 | dev[client] (sonnet) | `gh-client/src/{client,wire,model}.rs` (corps), `gh-client/tests/http.rs`, `gh-client/tests/fixtures/*.json` (OpenAPI : pull, files, reviews, issue comments, user, review créée, comment créé) | 0 | teste **seul**, sans les routes de dev[fake] (voir « Vague 1 » sous le tableau) ; décodage des exemples documentés ; `archived` lu dans `base.repo` (`true`, `false`, `base.repo` null) ; `mergeable` 3 cas ; PENDING retirée ; état ou statut inconnu = `UnexpectedResponse` ; `patch` absent ou vide = `None` ; `MessageBody` (blanc, 65 536, 65 537, `Debug` sans texte) ; corps JSON des POST lus dans `requests()` (`event`, `body` omis si `None`, `commit_id`) ; 201 / 200 ; 403, 422, 404 classés ; jeton absent des erreurs |
 | 2 | dev[tui-detail] (sonnet) | `ghu/src/ui/{pr_detail,text}.rs`, `ghu/src/ui/pulls.rs` (`Enter`), `ghu/tests/pr_detail.rs`, `ghu/tests/pull_list.rs` (test `Enter` repris) | 1 (fusionnée) et `qa` bout-en-bout client ↔ faux | #6 : `selection_is_bounded_and_enter_opens_the_detail` vert ; chaque critère au harnais (titre, auteur, branches, état, draft, mergeable / conflicts, Markdown, verdicts par reviewer, Pending ignorée, Dismissed, conversation ordonnée, défilement borné, `r`, `Esc` retour, chargement lent, 404 et 500 lisibles) ; lignes d'actions des 4 cas, dont un repo archivé après le chargement puis `r` (actions retirées) ; unitaires `actions`, `verdicts`, `clean`, `markdown` (sans panique sur entrée quelconque) ; fins de ligne `a\r\nb` sans `�`, `a\rb` avec ; test d'échappement du § 7 |
 | 3 | dev[tui-diff] (sonnet) | `ghu/src/ui/diff.rs`, `ghu/tests/diff.rs` | 2 | #7 : liste et compteurs, couleurs (style des cellules lu dans le tampon), `n` / `p` bornés, défilement vertical et horizontal, renommé sans changement, binaire, liste vide, pagination (> 100 fichiers avec `max_per_page` bas), erreur, échappement d'un patch hostile, patch CRLF sans `�` |
-| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête ; `TaskFailed` pendant Publishing (unitaire) : retour à Writing, message « may have been published ». **Amendement (relectures de #8)** : `ComposeScreen::new(target, kind, draft)` et `open_compose` de `pr_detail.rs` ; `uncertain` (unitaire par variante : Network, UnexpectedResponse, Api 500 / 502 / 599 oui ; Api 499 / 600, 403, 404, 422, 429, 401 non) ; au harnais : 500 et 502 → message incertain, `Esc` unique après un échec puis `r` puis `c` → texte revenu, puis double `Esc` le jette ; message gardé après frappe ; `q` sans effet en Confirm et en Publishing (aucun POST de plus, écran resté) |
+| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête ; `TaskFailed` pendant Publishing (unitaire) : retour à Writing, message « may have been published ». **Amendement (relectures de #8)** : `ComposeScreen::new(target, kind, draft)` et `open_compose` de `pr_detail.rs` ; `uncertain` (unitaire par variante : Network, UnexpectedResponse, Api 500 / 502 / 599 oui ; Api 499 / 600, 403, 404, 422, 429, 401 non) ; au harnais : 500 → message incertain (502 en unitaire d'`uncertain` : § 9), `Esc` unique après un échec puis `r` puis `c` → texte revenu, puis double `Esc` le jette ; message gardé après frappe ; `q` sans effet en Confirm et en Publishing (aucun POST de plus, écran resté) |
 | 4 | dev[tui-editor] (**opus**) | `ghu/src/editor.rs`, `ghu/src/bin/fake_editor.rs`, `ghu/src/ui/text_area.rs` (`Ctrl-E`, `edited`), `ghu/src/terminal.rs`, `ghu/tests/support/mod.rs`, `ghu/tests/editor.rs` | 3 (tui-compose) | #9 : ordre VISUAL > EDITOR > défaut (unitaire, défaut par `cfg`), découpage avec guillemets (unitaire), aller-retour (`upper`), `write` multi-ligne, introuvable, code 3, non UTF-8, `fill 1048576` accepté et `fill 1048577` = `TooLarge`, `ReturnedAtOnce` (faux éditeur `keep`, seuil du harnais fixé à 30 s) et ses contre-épreuves (`write` rapide : pas de `ReturnedAtOnce` ; `keep` avec un seuil `Duration::ZERO` : texte rendu inchangé, sans erreur), fichier temporaire supprimé ; boucle réelle par `spawn_blocking` ; au harnais : texte revenu dans la zone puis publié ; essai réel par l'utilisateur (vim sous WSL, notepad sous Windows avec une fenêtre Notepad déjà ouverte, `code.cmd --wait`) |
-| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 (Pending ou PR changée) : message exact du § 4, texte conservé ; publication incertaine (`uncertain`, réseau et 502) : message `review` ; après un 422, `Esc` puis `r` puis la même touche (`a` / `x`) rend le texte, l'autre Verdict ouvre une zone vide |
+| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 (Pending ou PR changée) : message exact du § 4, texte conservé ; publication incertaine (`uncertain`, réseau et 500 ; 502 en unitaire : § 9) : message `review` ; après un 422, `Esc` puis `r` puis la même touche (`a` / `x`) rend le texte, l'autre Verdict ouvre une zone vide |
 
 Modèles : `sonnet` (tableau « Agents ») sauf **tui-editor en opus** : protocole fil clavier / terminal / processus
 externe, propre à chaque OS, que les tests au harnais ne couvrent pas (seul l'essai réel le fera) ; une erreur y

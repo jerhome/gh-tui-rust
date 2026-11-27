@@ -95,29 +95,13 @@ pub(crate) enum Outcome {
     Pulls(gh_client::Result<Vec<PullRequest>>),
     /// The four requests of the PR detail (`pull`, `reviews`, `comments`, `current_user`), joined with
     /// `tokio::try_join!`: the first error wins (#6).
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: constructed from wave 2 (dev[tui-detail])"
-    )]
     /// Boxed: a `PrPage` is several times larger than the other variants (clippy `large_enum_variant`).
     PrPage(gh_client::Result<Box<pr_detail::PrPage>>),
     /// [`gh_client::Client::pull_files`] (#7).
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: constructed from wave 3 (dev[tui-diff])"
-    )]
     Files(gh_client::Result<Vec<gh_client::FileChange>>),
     /// [`gh_client::Client::post_comment`] (#8).
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: constructed from wave 3 (dev[tui-compose])"
-    )]
     CommentPosted(gh_client::Result<gh_client::Comment>),
     /// [`gh_client::Client::post_review`] (#10).
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: constructed from wave 4 (dev[tui-review])"
-    )]
     ReviewPosted(gh_client::Result<gh_client::Review>),
     /// The task panicked or was cancelled; show [`TASK_FAILED`].
     TaskFailed,
@@ -128,18 +112,10 @@ pub(crate) enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Signal {
     /// A Comment or Review was published on the PR shown below: reload it.
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: constructed from wave 3 (dev[tui-compose])"
-    )]
     Published,
     /// The compose screen was closed while the message of a failed publication was shown (ADR 0003 § 4,
     /// amendment of #8): the PR detail below keeps the text and gives it back when the same kind of text is
     /// opened again on it. Nothing is reloaded.
-    #[allow(
-        dead_code,
-        reason = "ADR 0003 § 4: constructed by compose.rs (dev[tui-compose], relectures of #8)"
-    )]
     Kept(Draft),
 }
 
@@ -247,14 +223,12 @@ impl Shared {
     /// in [`App`]; ignored with a `tracing::warn` in release). A call that asks to pop returns [`Flow::Handled`]
     /// (key) and calls neither [`Flow::Push`] nor [`Shared::push`]: `debug_assert` in [`App`]; in release the pop
     /// wins and the screens asked for are dropped (`tracing::warn`). The last call in one screen call wins.
-    #[allow(dead_code, reason = "ADR 0003: called from wave 3 (dev[tui-compose])")]
     pub(crate) fn pop(&mut self, signal: Option<Signal>) {
         self.popped = Some(signal);
     }
 
     /// Asks the loop to open the user's editor on `text` (#9). The latest request wins. The answer comes back
     /// through [`View::edited`] on the top screen ([`Ui::take_edit`], [`Ui::finish_edit`]). Never blocks.
-    #[allow(dead_code, reason = "ADR 0003: called from wave 4 (dev[tui-editor])")]
     pub(crate) fn request_edit(&mut self, text: String) {
         self.edit = Some(text);
     }

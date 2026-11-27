@@ -285,6 +285,47 @@ mod tests {
     }
 
     #[test]
+    fn a_502_with_an_html_gateway_page_is_an_api_error_without_message() {
+        let html = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body><center><h1>502 Bad Gateway</h1></center></body>\r\n</html>";
+        let error = run(502, &[("content-type", "text/html")], html);
+        assert_eq!(
+            error,
+            Error::Api {
+                status: 502,
+                message: String::new()
+            }
+        );
+        // The text shown to the user still names the status, and never contains the page.
+        let shown = error.to_string();
+        assert!(shown.contains("502"), "{shown}");
+        assert!(!shown.contains("<html"), "{shown}");
+    }
+
+    #[test]
+    fn a_503_with_an_empty_body_is_an_api_error_without_message() {
+        let error = run(503, &[], "");
+        assert_eq!(
+            error,
+            Error::Api {
+                status: 503,
+                message: String::new()
+            }
+        );
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[test]
+    fn a_500_with_a_json_message_keeps_it() {
+        assert_eq!(
+            run(500, &[], r#"{"message":"Server Error"}"#),
+            Error::Api {
+                status: 500,
+                message: "Server Error".into()
+            }
+        );
+    }
+
+    #[test]
     fn a_huge_message_is_truncated() {
         let body = format!(r#"{{"message":"{}"}}"#, "é".repeat(10_000));
         match run(500, &[], &body) {

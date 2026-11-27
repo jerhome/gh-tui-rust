@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-27 16:14.
+Mis à jour le 2026-11-27 16:21.
 
 ## État
 
@@ -20,18 +20,20 @@ Mis à jour le 2026-11-27 16:14.
 
 ## Prochaine action
 
-main = bad2ced (poussé) : #9 fusionné (3a2a24d, `Closes #9`), L2 (`allow(dead_code)` retirés) et L3 (tests 502
-HTML / 503 vide). Branche **wip-0.1-release** (6cf1fdc, poussée) = main + workflow de release (L4) : essai à blanc
-au push d'une branche `wip-*-release` (le lancement à la main n'est possible que depuis main), exécution
-46022428092 verte (3 archives, SHA256SUMS, publication sautée). Plan de livraison : `docs/version-0.1.md` (L1 à L9).
+main = 8561fff (poussé) : #9 fusionné, L2 à L7 faits (L6 qa OK : 6 passages sans échec, CI verte sur les 3 OS ;
+L7 relecteur : 2 tours, flux de release corrigé). Workflow de release : un tag `vX.Y.Z-rc.N` construit et publie une
+pré-release ; le tag final `vX.Y.Z` sur le même commit **republie les archives de la rc sans recompiler** (job
+`promote`) ; essai à blanc au push d'une branche `wip-*-release`. Toolchain fixée (`rust-toolchain.toml`,
+1.100.0). Plan de livraison : `docs/version-0.1.md` (L8 et L9 restent).
 
 1. **Essai réel de #9 par l'utilisateur** : fiche <https://claude.ai/artifact/6xH9KZCukSRTjnH6YVkBEt> (db, collection
    `essais` ; Claude la lit sans y écrire). Build : archives de l'exécution 46022428092, `ghu.exe` SHA-256
    91dc5998…f22ec0, `ghu` Linux SHA-256 74e13667…a44fd3. Q2 (éditeur par défaut sous Windows) tranchée après.
-2. Résultats de L6 (qa : vérification complète + 5 passages) et L7 (relecteur : L2, workflow de release) ; si OK :
-   fusionner wip-0.1-release dans main.
-3. Puis L8 : essai réel complet de la 0.1 (`docs/guide-essai-0.1.md`, nouvelle fiche avec le build et son
-   empreinte), L9 : critères de #1 relus, tag `v0.1.0` (ou `v0.1.0-rc.1` d'abord pour essayer la publication).
+2. **L8** (accord de l'utilisateur pour le tag) : tag `v0.1.0-rc.1` sur main → pré-release ; essai réel complet
+   (`docs/guide-essai-0.1.md`, nouvelle fiche avec le tag et les SHA-256 des assets de la pré-release). Relire avant
+   le tag la phrase « full manual trial » de `docs/release-notes-0.1.md`. Les jobs `publish` et `promote` n'ont
+   jamais tourné : la rc.1 est leur premier essai (un tag raté se supprime et se repose, une rc ne se déplace jamais).
+3. **L9** : critères de #1 relus, tag `v0.1.0` (promotion), vérification des assets.
 4. Rétro quand l'utilisateur la demande (skill local `retro`, retours dans `docs/retours-agents.md`).
 
 ## Points ouverts
@@ -39,6 +41,8 @@ au push d'une branche `wip-*-release` (le lancement à la main n'est possible qu
 - **Aide de la saisie inaccessible** : pendant la saisie d'un Comment ou d'une Review, `?` s'écrit dans le texte
   (`ui.rs`), donc l'aide de cette phase (`Ctrl-S`, `Ctrl-E`, `Esc`) ne s'affiche jamais ; seule la ligne
   d'indication montre ces touches. À trancher (architecte) : autre touche d'aide en saisie, ou retirer la table.
+- Mineur de relecture L7 (reporté) : `promote` compare le commit actuel du tag rc, pas celui du build ; parade
+  retenue : une rc ne se déplace jamais (option : inscrire le SHA du build dans la pré-release).
 - Constat mineur de relecture de #9 non corrigé : touches tapées très vite juste après `Ctrl-E` (vidange du canal et
   du tampon crossterm faite ; non testable sans pty : étape W7 de la fiche).
 

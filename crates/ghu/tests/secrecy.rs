@@ -2,8 +2,9 @@
 
 mod support;
 
-use gh_fake::{Failure, FailureResponse, Method, State};
+use gh_fake::{Failure, FailureResponse, Method, Pull, PullReview, ReviewState, State};
 use ghu::Launch;
+use ghu::{KeyCode, KeyModifiers};
 use support::{Harness, LogCapture, TestEnv, launch};
 
 const SECRET: &str = "ghp_KnownSecret0123456789abcdef";
@@ -80,5 +81,72 @@ fn the_token_never_shows_in_start_up_output_or_debug() {
     assert!(matches!(result, Launch::Exit(1)), "{result:?}");
     assert_hidden("stdout", &out);
     assert_hidden("stderr", &err);
+    assert_hidden("the logs", &logs.text());
+}
+
+/// A detail of PR #1 of `alice/notes` (by bob) with the known token, and the Review screen of `key` open.
+async fn review_screen(state: State, key: char) -> Harness {
+    let mut app = Harness::start(state).await;
+    app.wait_for("alice/notes").await;
+    app.press(KeyCode::Enter);
+    app.wait_for("Pull requests (open)").await;
+    app.settle().await;
+    app.press(KeyCode::Enter);
+    app.wait_for("Description").await;
+    app.settle().await;
+    app.press(KeyCode::Char(key));
+    app.wait_for("Ctrl-S publish…").await;
+    app
+}
+
+fn review_state() -> State {
+    let mut state = State::new(gh_fake::User {
+        login: "alice".into(),
+        id: 1,
+    });
+    state.token = SECRET.into();
+    state.repos = vec![gh_fake::Repo::new("alice", "notes")];
+    state.pulls = vec![Pull::new("alice", "notes", 1, "One", "bob")];
+    state
+}
+
+#[tokio::test]
+async fn the_token_never_shows_when_a_review_is_published() {
+    let logs = LogCapture::start();
+    let mut app = review_screen(review_state(), 'x').await;
+    app.type_text("needs work");
+    app.press_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    app.press(KeyCode::Char('y'));
+    app.wait_for("Review published: Request changes.").await;
+    app.settle().await;
+    let post = app
+        .fake
+        .requests()
+        .into_iter()
+        .find(|r| r.method == Method::Post)
+        .expect("the review was posted");
+    assert_eq!(post.token.as_deref(), Some(SECRET));
+    assert_hidden("the screen", &app.screen());
+    assert_hidden("the logs", &logs.text());
+}
+
+#[tokio::test]
+async fn the_token_never_shows_when_github_refuses_a_review_with_a_422() {
+    let logs = LogCapture::start();
+    let mut state = review_state();
+    state.pulls[0].reviews.push(PullReview {
+        id: 900,
+        author: Some("alice".into()),
+        state: ReviewState::Pending,
+        body: String::new(),
+        submitted_at: None,
+        commit_id: String::new(),
+    });
+    let mut app = review_screen(state, 'a').await;
+    app.press_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    app.press(KeyCode::Char('y'));
+    app.wait_for("GitHub refused the review (422).").await;
+    app.settle().await;
+    assert_hidden("the screen", &app.screen());
     assert_hidden("the logs", &logs.text());
 }

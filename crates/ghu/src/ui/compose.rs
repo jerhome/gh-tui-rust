@@ -1,14 +1,13 @@
 //! Writing, confirming and publishing a Comment (#8) or a Review (#10). Contract: ADR 0003 § 4 « Saisie et
 //! confirmation » and § 6.
 //!
-//! The Comment path is written here: Writing → Confirm → Publishing, answered by [`super::Outcome::CommentPosted`].
-//! The Review branches stay on a provisional body (title, `Not available yet.`, `Esc` goes back) until
-//! dev[tui-review] writes them ([`super::Outcome::ReviewPosted`]). Success:
-//! `Shared::pop(Some(Signal::Published))`. Nothing is sent before the Confirm phase has been answered with `y` or
+//! Writing → Confirm → Publishing, answered by [`super::Outcome::CommentPosted`] or
+//! [`super::Outcome::ReviewPosted`]. Success: `Shared::pop(Some(Signal::Published))`. Nothing is sent before the Confirm phase has been answered with `y` or
 //! `Enter`.
 
 use gh_client::{
-    BodyProblem, CommitSha, Error, MAX_BODY_CHARS, MessageBody, PrNumber, RepoName, Verdict,
+    BodyProblem, CommitSha, Error, MAX_BODY_CHARS, MessageBody, PrNumber, RepoName, ReviewRequest,
+    Verdict,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -32,10 +31,6 @@ pub(crate) struct Target {
     /// The PR.
     pub(crate) number: PrNumber,
     /// `head.sha` seen on the detail (Review `commit_id`).
-    #[allow(
-        dead_code,
-        reason = "ADR 0003: read by dev[tui-review] (Review commit_id)"
-    )]
     pub(crate) head: CommitSha,
 }
 
@@ -134,6 +129,11 @@ fn maybe_published(what: &str) -> String {
     )
 }
 
+/// Shown when GitHub refuses a Review with a 422: a pending review of the user, or a PR that changed since the load.
+const REVIEW_REFUSED: &str = "GitHub refused the review (422). If you started a review on the website (pending review), \
+     submit or delete it there; or the PR changed: press Esc, then r to refresh; the text comes back when you open \
+     the review again.";
+
 /// The key of the global help (`?`, with or without Shift).
 fn is_help(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('?')
@@ -153,6 +153,14 @@ pub(crate) struct ComposeScreen {
 }
 
 impl ComposeScreen {
+    /// `comment` or `review`: the word of the messages.
+    fn what(&self) -> &'static str {
+        match self.kind {
+            Kind::Comment => "comment",
+            Kind::Review(_) => "review",
+        }
+    }
+
     /// Opened by `c`, `a` or `x` on the detail, only when `pr_detail::actions` allows it. No request at opening.
     /// `draft`: the text kept for this `kind` (`Signal::Kept`), put in the field with the cursor at the end and
     /// no message; `None`: an empty field.
@@ -201,10 +209,7 @@ impl ComposeScreen {
             shared.pop(None);
             return;
         }
-        let what = match self.kind {
-            Kind::Comment => "comment",
-            Kind::Review(_) => "review",
-        };
+        let what = self.what();
         shared.notify(Notice::Info(format!(
             "Text kept: open the {what} again to get it back."
         )));
@@ -218,6 +223,15 @@ impl ComposeScreen {
     fn check_text(&mut self, shared: &mut Shared) {
         match MessageBody::new(&self.text.text()) {
             Ok(_) => self.phase = Phase::Confirm,
+            // An Approve may go without text.
+            Err(Error::InvalidBody {
+                problem: BodyProblem::Blank,
+            }) if self.kind == Kind::Review(Verdict::Approve) => self.phase = Phase::Confirm,
+            Err(Error::InvalidBody {
+                problem: BodyProblem::Blank,
+            }) if self.kind == Kind::Review(Verdict::RequestChanges) => {
+                shared.notify(Notice::Error("Request changes needs a text.".to_owned()))
+            }
             Err(Error::InvalidBody {
                 problem: BodyProblem::Blank,
             }) => shared.notify(Notice::Error("Write a text first.".to_owned())),
@@ -245,21 +259,56 @@ impl ComposeScreen {
         self.error = None;
         let text = self.text.text();
         let body = match MessageBody::new(&text) {
-            Ok(body) => body,
+            Ok(body) => Some(body),
+            // Only an Approve may go without text: it is sent without `body`.
+            Err(Error::InvalidBody {
+                problem: BodyProblem::Blank,
+            }) if self.kind == Kind::Review(Verdict::Approve) => None,
             Err(error) => {
                 // Cannot happen (the text was checked and the Confirm phase does not edit it); stay safe.
                 self.phase = Phase::Writing;
-                self.error = Some(error_message("publish the comment", &error));
+                self.error = Some(error_message(
+                    &format!("publish the {}", self.what()),
+                    &error,
+                ));
                 return;
             }
         };
-        tracing::debug!(chars = text.chars().count(), "publishing a comment");
+        tracing::debug!(
+            chars = text.chars().count(),
+            what = self.what(),
+            "publishing"
+        );
         let client = shared.client().clone();
         let repo = self.target.repo.clone();
         let number = self.target.number;
-        let id = shared.spawn(async move {
-            Outcome::CommentPosted(client.post_comment(&repo, number, &body).await)
-        });
+        let id = match (self.kind, body) {
+            (Kind::Comment, Some(body)) => shared.spawn(async move {
+                Outcome::CommentPosted(client.post_comment(&repo, number, &body).await)
+            }),
+            (Kind::Review(verdict), body) => {
+                let request = match (verdict, body) {
+                    (Verdict::Approve, body) => ReviewRequest::Approve { body },
+                    (Verdict::RequestChanges, Some(body)) => ReviewRequest::RequestChanges { body },
+                    (Verdict::RequestChanges, None) => {
+                        // Cannot happen (Ctrl-S refuses a blank text); stay safe.
+                        self.phase = Phase::Writing;
+                        self.error = Some("Request changes needs a text.".to_owned());
+                        return;
+                    }
+                };
+                let head = self.target.head.clone();
+                shared.spawn(async move {
+                    Outcome::ReviewPosted(client.post_review(&repo, number, &head, &request).await)
+                })
+            }
+            (Kind::Comment, None) => {
+                // Cannot happen (a blank Comment is refused by Ctrl-S); stay safe.
+                self.phase = Phase::Writing;
+                self.error = Some("Write a text first.".to_owned());
+                return;
+            }
+        };
         self.phase = Phase::Publishing(id);
     }
 
@@ -278,13 +327,6 @@ impl ComposeScreen {
     fn failed(&mut self, message: String) {
         self.phase = Phase::Writing;
         self.error = Some(message);
-    }
-
-    fn render_provisional(frame: &mut Frame<'_>, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(" Not available yet.").block(Block::bordered()),
-            area,
-        );
     }
 
     fn render_writing(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -321,21 +363,35 @@ impl ComposeScreen {
             Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
         let width = usize::from(top.width.saturating_sub(2)).max(1);
         let header = format!(
-            "Publish this Comment on {} {}?",
-            self.target.repo, self.target.number
+            "Publish this {} on {} {}?",
+            match self.kind {
+                Kind::Comment => "Comment",
+                Kind::Review(_) => "Review",
+            },
+            self.target.repo,
+            self.target.number
         );
         // The header may be long (owner/name): it is wrapped like the text.
         let mut lines: Vec<Line<'_>> = wrap(&clean(&header), width)
             .into_iter()
             .map(|row| Line::from(format!(" {row}")).bold())
             .collect();
+        if let Kind::Review(verdict) = self.kind {
+            lines.push(Line::from(match verdict {
+                Verdict::Approve => " Verdict: Approve",
+                Verdict::RequestChanges => " Verdict: Request changes",
+            }));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(" Text:"));
         let text = self.text.text();
-        let rows: Vec<String> = text
-            .split('\n')
-            .flat_map(|line| wrap(&clean(line), width))
-            .collect();
+        let rows: Vec<String> = if text.trim().is_empty() {
+            vec!["(no text)".to_owned()]
+        } else {
+            text.split('\n')
+                .flat_map(|line| wrap(&clean(line), width))
+                .collect()
+        };
         let height = usize::from(top.height);
         let room = height.saturating_sub(lines.len());
         if rows.len() <= room {
@@ -371,23 +427,19 @@ impl View for ComposeScreen {
     }
 
     fn help(&self) -> Vec<HelpRow> {
-        match (self.kind, self.phase) {
-            (Kind::Review(_), _) | (_, Phase::Publishing(_)) => Vec::new(),
-            (Kind::Comment, Phase::Writing) => keys::help_rows(&WRITING),
-            (Kind::Comment, Phase::Confirm) => keys::help_rows(&CONFIRM),
+        match self.phase {
+            Phase::Publishing(_) => Vec::new(),
+            Phase::Writing => keys::help_rows(&WRITING),
+            Phase::Confirm => keys::help_rows(&CONFIRM),
         }
     }
 
-    /// Only the Writing phase of a Comment takes text (every key but `Ctrl-C`).
+    /// Only the Writing phase takes text (every key but `Ctrl-C`).
     fn editing(&self) -> bool {
-        self.kind == Kind::Comment && self.phase == Phase::Writing
+        self.phase == Phase::Writing
     }
 
     fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
-        if self.kind != Kind::Comment {
-            // Provisional Review screens: every key goes to the global table (`Esc` back).
-            return Flow::Ignored;
-        }
         match self.phase {
             Phase::Writing => self.key_writing(key, shared),
             Phase::Confirm => self.key_confirm(key, shared),
@@ -411,13 +463,31 @@ impl View for ComposeScreen {
                 shared.notify(Notice::Info("Comment published.".to_owned()));
                 shared.pop(Some(Signal::Published));
             }
-            Outcome::CommentPosted(Err(error)) if uncertain(&error) => {
-                tracing::warn!(%error, "no clear answer to the comment publication");
-                self.failed(maybe_published("comment"));
+            Outcome::ReviewPosted(Ok(_)) => {
+                let verdict = match self.kind {
+                    Kind::Review(Verdict::RequestChanges) => "Request changes",
+                    _ => "Approve",
+                };
+                shared.notify(Notice::Info(format!("Review published: {verdict}.")));
+                shared.pop(Some(Signal::Published));
+            }
+            Outcome::CommentPosted(Err(error)) | Outcome::ReviewPosted(Err(error))
+                if uncertain(&error) =>
+            {
+                tracing::warn!(%error, "no clear answer to the publication");
+                self.failed(maybe_published(self.what()));
             }
             Outcome::TaskFailed => {
-                tracing::warn!("the comment publication task died");
-                self.failed(maybe_published("comment"));
+                tracing::warn!("the publication task died");
+                self.failed(maybe_published(self.what()));
+            }
+            Outcome::ReviewPosted(Err(Error::Unprocessable { .. })) => {
+                tracing::warn!("GitHub refused the review (422)");
+                self.failed(REVIEW_REFUSED.to_owned());
+            }
+            Outcome::ReviewPosted(Err(error)) => {
+                tracing::warn!(%error, "publishing the review failed");
+                self.failed(error_message("publish the review", &error));
             }
             Outcome::CommentPosted(Err(error)) => {
                 tracing::warn!(%error, "publishing the comment failed");
@@ -434,10 +504,6 @@ impl View for ComposeScreen {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.kind != Kind::Comment {
-            Self::render_provisional(frame, area);
-            return;
-        }
         match self.phase {
             Phase::Writing => self.render_writing(frame, area),
             Phase::Confirm => self.render_confirm(frame, area),
@@ -525,16 +591,21 @@ mod tests {
     fn the_key_tables_use_no_reserved_key_and_their_help_fits() {
         assert!(!keys::uses_reserved_key(&WRITING));
         assert!(!keys::uses_reserved_key(&CONFIRM));
-        let mut compose = screen(Kind::Comment);
-        for phase in [Phase::Writing, Phase::Confirm] {
-            compose.phase = phase;
-            let rows = compose.help();
-            assert_eq!(rows.len(), 2);
-            for row in rows {
-                assert!(row.label.chars().count() <= 8 && row.what.chars().count() <= 26);
+        for kind in [
+            Kind::Comment,
+            Kind::Review(Verdict::Approve),
+            Kind::Review(Verdict::RequestChanges),
+        ] {
+            let mut compose = screen(kind);
+            for phase in [Phase::Writing, Phase::Confirm] {
+                compose.phase = phase;
+                let rows = compose.help();
+                assert_eq!(rows.len(), 2);
+                for row in rows {
+                    assert!(row.label.chars().count() <= 8 && row.what.chars().count() <= 26);
+                }
             }
         }
-        assert!(screen(Kind::Review(Verdict::Approve)).help().is_empty());
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -837,21 +908,62 @@ mod tests {
     }
 
     #[test]
-    fn a_review_screen_stays_provisional_it_takes_no_text_and_no_key() {
+    fn a_review_screen_takes_text_while_writing_and_q_is_text_there() {
         let mut shared = test_shared();
         let mut compose = screen(Kind::Review(Verdict::RequestChanges));
-        assert!(!compose.editing());
-        compose.paste("ignored", &mut shared);
-        assert_eq!(compose.text.text(), "");
-        let flow = compose.key(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            &mut shared,
-        );
-        assert!(matches!(flow, Flow::Ignored));
-        assert_eq!(compose.phase, Phase::Writing);
+        assert!(compose.editing());
+        compose.paste("some text", &mut shared);
+        assert_eq!(compose.text.text(), "some text");
+        assert!(matches!(
+            compose.key(key(KeyCode::Char('q')), &mut shared),
+            Flow::Handled
+        ));
+        assert_eq!(compose.text.text(), "some textq");
         assert_eq!(
             compose.title(),
             "alice/notes · #1 · Review: Request changes"
         );
+        compose.phase = Phase::Confirm;
+        assert!(!compose.editing());
+    }
+
+    #[test]
+    fn ctrl_s_on_a_blank_text_depends_on_the_kind() {
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for (kind, confirms) in [
+            (Kind::Review(Verdict::Approve), true),
+            (Kind::Review(Verdict::RequestChanges), false),
+            (Kind::Comment, false),
+        ] {
+            let mut shared = test_shared();
+            let mut compose = screen(kind);
+            compose.key(ctrl_s, &mut shared);
+            assert_eq!(compose.phase == Phase::Confirm, confirms, "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_review_422_gives_its_message_but_a_comment_422_does_not() {
+        let unprocessable = || Error::Unprocessable {
+            message: String::new(),
+        };
+        let mut shared = test_shared();
+        let mut review = screen(Kind::Review(Verdict::Approve));
+        let id = shared.spawn(async { Outcome::TaskFailed });
+        review.phase = Phase::Publishing(id);
+        assert!(
+            review
+                .apply(id, Outcome::ReviewPosted(Err(unprocessable())), &mut shared)
+                .is_none()
+        );
+        assert_eq!(review.error.as_deref(), Some(REVIEW_REFUSED));
+        assert_eq!(review.phase, Phase::Writing);
+        let (mut comment, id) = publishing(&mut shared).await;
+        comment.apply(
+            id,
+            Outcome::CommentPosted(Err(unprocessable())),
+            &mut shared,
+        );
+        assert_ne!(comment.error.as_deref(), Some(REVIEW_REFUSED));
     }
 }

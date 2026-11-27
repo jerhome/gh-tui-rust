@@ -124,7 +124,8 @@ pub(crate) enum Outcome {
 }
 
 /// News given to the screen that becomes the top one when the screen above closes itself ([`Shared::pop`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not `Copy`: [`Signal::Kept`] owns the user's text, moved to the screen below.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Signal {
     /// A Comment or Review was published on the PR shown below: reload it.
     #[allow(
@@ -132,6 +133,35 @@ pub(crate) enum Signal {
         reason = "ADR 0003: constructed from wave 3 (dev[tui-compose])"
     )]
     Published,
+    /// The compose screen was closed while the message of a failed publication was shown (ADR 0003 § 4,
+    /// amendment of #8): the PR detail below keeps the text and gives it back when the same kind of text is
+    /// opened again on it. Nothing is reloaded.
+    #[allow(
+        dead_code,
+        reason = "ADR 0003 § 4: constructed by compose.rs (dev[tui-compose], relectures of #8)"
+    )]
+    Kept(Draft),
+}
+
+/// The text of a compose screen closed after a failed publication, owned by the PR detail that opened it until
+/// it is reopened with the same [`compose::Kind`] (then moved into the new compose screen) or the detail is
+/// closed (then dropped: drafts live for one detail screen, never on disk). `Debug` shows the kind and the
+/// length only: the text may be private and must not reach logs.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Draft {
+    /// What the text was written for: a Comment, or a Review with its Verdict.
+    pub(crate) kind: compose::Kind,
+    /// The text of the field, as `TextArea::text` gave it (not blank: a blank text is never kept).
+    pub(crate) text: String,
+}
+
+impl std::fmt::Debug for Draft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Draft")
+            .field("kind", &self.kind)
+            .field("chars", &self.text.chars().count())
+            .finish()
+    }
 }
 
 /// Message for [`Outcome::TaskFailed`].
@@ -689,6 +719,58 @@ mod tests {
         assert_eq!(app.top().title(), "popper");
         assert_eq!(*signals.borrow(), vec![Signal::Published]);
         assert!(app.shared.popped.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_kept_draft_reaches_the_screen_below_with_its_text() {
+        /// Closes itself with a kept draft on any key.
+        struct Keeper;
+        impl View for Keeper {
+            fn title(&self) -> String {
+                "keeper".to_owned()
+            }
+            fn help(&self) -> Vec<HelpRow> {
+                Vec::new()
+            }
+            fn key(&mut self, _key: KeyEvent, shared: &mut Shared) -> Flow {
+                shared.pop(Some(Signal::Kept(Draft {
+                    kind: compose::Kind::Comment,
+                    text: "my text".to_owned(),
+                })));
+                Flow::Handled
+            }
+            fn apply(&mut self, _: RequestId, outcome: Outcome, _: &mut Shared) -> Option<Outcome> {
+                Some(outcome)
+            }
+            fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
+        }
+        let below = Popper::default();
+        let signals = std::rc::Rc::clone(&below.signals);
+        let mut app = app_with(vec![Box::new(Pusher), Box::new(below), Box::new(Keeper)]);
+        press(&mut app, 'x');
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(
+            *signals.borrow(),
+            vec![Signal::Kept(Draft {
+                kind: compose::Kind::Comment,
+                text: "my text".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn the_debug_of_a_draft_shows_its_length_not_its_text() {
+        let draft = Draft {
+            kind: compose::Kind::Review(gh_client::Verdict::RequestChanges),
+            text: "secret plan 日本".to_owned(),
+        };
+        let shown = format!("{draft:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(
+            shown.contains("chars: 14") && shown.contains("RequestChanges"),
+            "{shown}"
+        );
+        assert!(!format!("{:?}", Signal::Kept(draft)).contains("secret"));
     }
 
     #[tokio::test]

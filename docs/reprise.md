@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-27 16:32.
+Mis à jour le 2026-11-27 16:35.
 
 ## État
 
@@ -32,16 +32,18 @@ pré-release ; le tag final `vX.Y.Z` sur le même commit **republie les archives
    tirées de `docs/guide-essai-0.1.md` ; Claude la lit sans y écrire). Elle couvre l'éditeur (A8, B1) : l'ancienne
    fiche de #9 (<https://claude.ai/artifact/6xH9KZCukSRTjnH6YVkBEt>, build d'essai à blanc) devient facultative.
    Constat : `ghu` Linux est reproductible (même SHA-256 que l'essai à blanc), `ghu.exe` non.
-2. **F1 (décision de l'utilisateur, 16:27)** : en saisie, `?` reste un caractère et F1 ouvre l'aide (partout).
-   Branche `wip-help-f1` : code fait, relecture À CORRIGER (q dans l'aide quittait en jetant le texte → décision :
-   `q` sans effet dans l'aide au-dessus d'un texte en cours ; double Esc désarmé à l'ouverture de l'aide), corrections
-   par dev[tui] ; restent : 2e relecture, ADR 0003 amendée (architecte), fusion, puis `v0.1.0-rc.2` et re-test F1
-   (nouvelle section de fiche). Les défauts de l'essai rc.1 partent dans la même rc.2.
+2. **F1 fusionné dans main** (décision de l'utilisateur, 16:27 ; 2 relectures, 541 tests) : en saisie, `?` reste un
+   caractère et F1 ouvre l'aide (partout) ; `q` sans effet dans l'aide au-dessus d'un texte en cours ; double Esc
+   désarmé à l'ouverture de l'aide. Restent : ADR 0003 à amender (§ Writing : F1, `q` dans l'aide ; architecte),
+   puis `v0.1.0-rc.2` avec les défauts de l'essai rc.1, et re-test F1 (nouvelle section de fiche).
 3. **L9** : critères de #1 relus, tag `v0.1.0` (promotion), vérification des assets.
 4. Rétro quand l'utilisateur la demande (skill local `retro`, retours dans `docs/retours-agents.md`).
 
 ## Points ouverts
 
+- Mineurs de la relecture F1 (reportés) : pendant Publishing, `?` ou F1 puis `q` quitte (texte perdu si la
+  publication échoue) → inclure Publishing dans `text_in_progress` ; l'aide du filtre de la liste des repos montre
+  les touches du mode normal.
 - Mineur de relecture L7 (reporté) : `promote` compare le commit actuel du tag rc, pas celui du build ; parade
   retenue : une rc ne se déplace jamais (option : inscrire le SHA du build dans la pré-release).
 - Constat mineur de relecture de #9 non corrigé : touches tapées très vite juste après `Ctrl-E` (vidange du canal et

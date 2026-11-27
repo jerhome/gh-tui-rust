@@ -1,6 +1,6 @@
 # Point de reprise (versionné)
 
-Mis à jour le 2026-11-27 16:21.
+Mis à jour le 2026-11-27 16:32.
 
 ## État
 
@@ -26,21 +26,22 @@ pré-release ; le tag final `vX.Y.Z` sur le même commit **republie les archives
 `promote`) ; essai à blanc au push d'une branche `wip-*-release`. Toolchain fixée (`rust-toolchain.toml`,
 1.100.0). Plan de livraison : `docs/version-0.1.md` (L8 et L9 restent).
 
-1. **Essai réel de #9 par l'utilisateur** : fiche <https://claude.ai/artifact/6xH9KZCukSRTjnH6YVkBEt> (db, collection
-   `essais` ; Claude la lit sans y écrire). Build : archives de l'exécution 46022428092, `ghu.exe` SHA-256
-   91dc5998…f22ec0, `ghu` Linux SHA-256 74e13667…a44fd3. Q2 (éditeur par défaut sous Windows) tranchée après.
-2. **L8** (accord de l'utilisateur pour le tag) : tag `v0.1.0-rc.1` sur main → pré-release ; essai réel complet
-   (`docs/guide-essai-0.1.md`, nouvelle fiche avec le tag et les SHA-256 des assets de la pré-release). Relire avant
-   le tag la phrase « full manual trial » de `docs/release-notes-0.1.md`. Les jobs `publish` et `promote` n'ont
-   jamais tourné : la rc.1 est leur premier essai (un tag raté se supprime et se repose, une rc ne se déplace jamais).
+1. **L8 en cours : essai réel complet de la 0.1 par l'utilisateur** sur la pré-release `v0.1.0-rc.1` (commit
+   f45230a, exécution Release 46025140810 ; `ghu.exe` SHA-256 bd6282a5…3627c, `ghu` Linux SHA-256
+   74e13667…a44fd3). Fiche <https://claude.ai/artifact/RW2bk6EtgFXUvirmbY27dk> (db, collection `essais`, 83 étapes
+   tirées de `docs/guide-essai-0.1.md` ; Claude la lit sans y écrire). Elle couvre l'éditeur (A8, B1) : l'ancienne
+   fiche de #9 (<https://claude.ai/artifact/6xH9KZCukSRTjnH6YVkBEt>, build d'essai à blanc) devient facultative.
+   Constat : `ghu` Linux est reproductible (même SHA-256 que l'essai à blanc), `ghu.exe` non.
+2. **F1 (décision de l'utilisateur, 16:27)** : en saisie, `?` reste un caractère et F1 ouvre l'aide (partout).
+   Branche `wip-help-f1` : code fait, relecture À CORRIGER (q dans l'aide quittait en jetant le texte → décision :
+   `q` sans effet dans l'aide au-dessus d'un texte en cours ; double Esc désarmé à l'ouverture de l'aide), corrections
+   par dev[tui] ; restent : 2e relecture, ADR 0003 amendée (architecte), fusion, puis `v0.1.0-rc.2` et re-test F1
+   (nouvelle section de fiche). Les défauts de l'essai rc.1 partent dans la même rc.2.
 3. **L9** : critères de #1 relus, tag `v0.1.0` (promotion), vérification des assets.
 4. Rétro quand l'utilisateur la demande (skill local `retro`, retours dans `docs/retours-agents.md`).
 
 ## Points ouverts
 
-- **Aide de la saisie inaccessible** : pendant la saisie d'un Comment ou d'une Review, `?` s'écrit dans le texte
-  (`ui.rs`), donc l'aide de cette phase (`Ctrl-S`, `Ctrl-E`, `Esc`) ne s'affiche jamais ; seule la ligne
-  d'indication montre ces touches. À trancher (architecte) : autre touche d'aide en saisie, ou retirer la table.
 - Mineur de relecture L7 (reporté) : `promote` compare le commit actuel du tag rc, pas celui du build ; parade
   retenue : une rc ne se déplace jamais (option : inscrire le SHA du build dans la pré-release).
 - Constat mineur de relecture de #9 non corrigé : touches tapées très vite juste après `Ctrl-E` (vidange du canal et

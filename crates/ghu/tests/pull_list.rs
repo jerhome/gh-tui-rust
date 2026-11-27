@@ -249,7 +249,7 @@ async fn the_help_shows_tab() {
 }
 
 #[tokio::test]
-async fn selection_is_bounded_and_enter_does_nothing_yet() {
+async fn selection_is_bounded_and_enter_opens_the_detail() {
     let mut app = open_pulls(state_with(vec![
         pr(1, "Alpha", "bob", PullState::Open, 3),
         pr(2, "Beta", "bob", PullState::Open, 4),
@@ -274,5 +274,12 @@ async fn selection_is_bounded_and_enter_does_nothing_yet() {
     assert!(selected(&app.screen()).contains("Alpha"));
     app.press(KeyCode::Enter);
     let screen = app.screen();
-    assert!(screen.contains("Pull requests (open)"), "{screen}");
+    assert!(screen.contains("ghu · alice/notes · #1"), "{screen}");
+    assert!(!screen.contains("Pull requests (open)"), "{screen}");
+    app.press(KeyCode::Esc);
+    assert!(
+        app.screen().contains("Pull requests (open)"),
+        "{}",
+        app.screen()
+    );
 }

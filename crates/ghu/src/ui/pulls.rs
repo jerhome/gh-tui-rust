@@ -11,14 +11,15 @@
 //!   (no cache), the previous rows stay visible until the answer comes, and only the answer to the latest request
 //!   is applied ([`super::RequestId`]).
 //! - **Refresh** `r`: reloads the current filter, same rules.
-//! - **Selection**: `Up`/`k`, `Down`/`j` (bounded); the list scrolls to keep it visible. `Enter` is reserved
-//!   for the PR detail (#6) and does nothing yet (`Flow::Handled`, no notice).
+//! - **Selection**: `Up`/`k`, `Down`/`j` (bounded); the list scrolls to keep it visible. `Enter` opens the detail of
+//!   the selected PR ([`PrDetailScreen`], #6); on an empty list it does nothing.
 //! - **Back**: `Esc` (global) returns to the Repo list, unchanged (selection, filter). Answers that arrive after
 //!   leaving are dropped by the stack.
 //! - **Errors**: in red in the body, `Cannot load the pull requests: <reason>` ([`super::error_message`]);
 //!   [`super::TASK_FAILED`] for a failed task. `r` retries.
 //!
-//! Key table (help order): `Tab` Open / closed+merged · `r` Refresh · `Up/k` `Down/j` Move. No reserved key.
+//! Key table (help order): `Enter` Open the PR · `Tab` Open / closed+merged · `r` Refresh · `Up/k` `Down/j` Move.
+//! No reserved key.
 //!
 
 use gh_client::{PrState, PullFilter, PullRequest, Repo};
@@ -30,12 +31,14 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::keys::{self, Binding, HelpRow};
 use super::list::{Content, Selection};
+use super::pr_detail::PrDetailScreen;
 use super::{Flow, Outcome, RequestId, Shared, View, error_message};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Actions of this screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    Open,
     Toggle,
     Refresh,
     Up,
@@ -43,7 +46,13 @@ enum Action {
 }
 
 /// Key table of this screen (help order).
-const TABLE: [Binding<Action>; 4] = [
+const TABLE: [Binding<Action>; 5] = [
+    Binding {
+        label: "Enter",
+        what: "Open the PR",
+        action: Action::Open,
+        keys: &[(KeyCode::Enter, KeyModifiers::NONE)],
+    },
     Binding {
         label: "Tab",
         what: "Open / closed + merged",
@@ -163,11 +172,15 @@ impl View for PullsScreen {
     }
 
     fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
-        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
-            // Reserved for the PR detail (#6): nothing yet.
-            return Flow::Handled;
-        }
         match keys::lookup(&TABLE, key) {
+            Some(Action::Open) => match self.content.items().get(self.selected.index()) {
+                Some(pull) => Flow::Push(Box::new(PrDetailScreen::new(
+                    self.repo.name.clone(),
+                    pull.number,
+                    shared,
+                ))),
+                None => Flow::Handled,
+            },
             Some(Action::Toggle) => {
                 self.filter = self.filter.toggled();
                 self.selected.reset();

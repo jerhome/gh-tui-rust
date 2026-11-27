@@ -1,0 +1,8 @@
+{
+  "login": "octocat",
+  "id": 1,
+  "type": "User",
+  "site_admin": false,
+  "name": "monalisa octocat",
+  "email": "octocat@github.com"
+}

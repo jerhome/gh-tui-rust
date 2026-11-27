@@ -7,7 +7,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use gh_client::{Affiliation, ApiBase, Client, Error, PrState, PullFilter, RepoName, Token};
+use gh_client::{
+    Affiliation, ApiBase, BodyProblem, Client, CommitSha, Error, FileStatus, MAX_BODY_CHARS,
+    Mergeable, MessageBody, PrNumber, PrState, PullFilter, RepoName, ReviewRequest, ReviewState,
+    Token, Verdict,
+};
 use gh_fake::{
     Access, Failure, FailureResponse, FakeGitHub, Method, Pull, PullState, Repo, State, User,
 };
@@ -63,6 +67,21 @@ fn scripted_server(
             while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
                 head.push(byte[0]);
             }
+            // A POST announces its body: read it all before answering (an unread body can turn the close into a
+            // RST on the client side). The reported text is the head followed by the body.
+            let announced = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; announced];
+            if stream.read_exact(&mut body).is_err() {
+                body.clear();
+            }
+            head.extend_from_slice(&body);
             let head = String::from_utf8_lossy(&head).into_owned();
             let answer = respond(index, &head, port);
             tx.send(head).ok();
@@ -841,4 +860,732 @@ async fn fake_repo_and_pulls_with_a_bad_token_are_unauthorized_without_the_token
 
     assert_eq!(repo, Error::Unauthorized);
     assert_eq!(pulls, Error::Unauthorized);
+}
+
+// ---- ADR 0003 (#6-#10): detail, reviews, comments, files, user, and the two publishing routes ----
+//
+// Successes are served by the scripted server from the documented examples (the fake has no routes for them in
+// this wave); failures come from the fake's injected `Failure`, which is applied before routing; the JSON bodies
+// of the POSTs are read from the fake's `requests()`, recorded before routing.
+
+const PULL_EXAMPLE: &str = include_str!("fixtures/pull.json");
+const REVIEWS_EXAMPLE: &str = include_str!("fixtures/reviews.json");
+const REVIEW_CREATED_EXAMPLE: &str = include_str!("fixtures/review_created.json");
+const COMMENTS_EXAMPLE: &str = include_str!("fixtures/issue_comments.json");
+const COMMENT_CREATED_EXAMPLE: &str = include_str!("fixtures/comment_created.json");
+const FILES_EXAMPLE: &str = include_str!("fixtures/files.json");
+const USER_EXAMPLE: &str = include_str!("fixtures/user.json");
+
+const HEAD_SHA: &str = "6dcb09b5b57875f334f61aebed695e2e4193db5e";
+
+fn pr(number: u64) -> PrNumber {
+    PrNumber::new(number).expect("number")
+}
+
+fn sha() -> CommitSha {
+    CommitSha::parse(HEAD_SHA).expect("sha")
+}
+
+fn text(chars: usize) -> MessageBody {
+    MessageBody::new(&"é".repeat(chars)).expect("body")
+}
+
+fn review_json(id: u64, state: &str) -> String {
+    format!(
+        r#"{{"id":{id},"user":{{"login":"carol"}},"body":"b{id}","state":"{state}","submitted_at":"2026-03-04T05:06:07Z"}}"#
+    )
+}
+
+fn comment_json(id: u64) -> String {
+    format!(
+        r#"{{"id":{id},"user":{{"login":"carol"}},"body":"c{id}","created_at":"2026-03-04T05:06:07Z"}}"#
+    )
+}
+
+fn file_json(filename: &str) -> String {
+    format!(r#"{{"filename":"{filename}","status":"modified","additions":1,"deletions":0}}"#)
+}
+
+fn next_page(path: &str) -> String {
+    format!("Link: <{path}?page=2>; rel=\"next\"\r\n")
+}
+
+#[test]
+fn commit_sha_accepts_only_lowercase_hex_of_40_or_64_digits() {
+    let sha64 = "ab".repeat(32);
+    for ok in [HEAD_SHA, sha64.as_str(), &"0".repeat(40)] {
+        let sha = CommitSha::parse(ok).expect(ok);
+        assert_eq!(sha.as_str(), ok);
+        assert_eq!(sha.short(), &ok[..7]);
+    }
+    let upper = HEAD_SHA.to_ascii_uppercase();
+    let spaced = format!(" {HEAD_SHA}");
+    let non_hex = format!("g{}", &HEAD_SHA[1..]);
+    let accented = format!("é{}", &HEAD_SHA[2..]);
+    for bad in [
+        "",
+        "6dcb09b",
+        &HEAD_SHA[..39],
+        &format!("{HEAD_SHA}0"),
+        &"a".repeat(63),
+        &"a".repeat(65),
+        upper.as_str(),
+        spaced.as_str(),
+        non_hex.as_str(),
+        accented.as_str(),
+    ] {
+        assert_eq!(CommitSha::parse(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn message_body_refuses_blank_and_more_than_the_limit() {
+    assert_eq!(MAX_BODY_CHARS, 65_536);
+    let blank = Error::InvalidBody {
+        problem: BodyProblem::Blank,
+    };
+    for text in ["", " ", "\n\t \r\n", "\u{a0}\u{2003}"] {
+        assert_eq!(MessageBody::new(text).expect_err(text), blank, "{text:?}");
+    }
+    // Blank wins over length: a huge run of spaces is blank, not too long.
+    assert_eq!(
+        MessageBody::new(&" ".repeat(70_000)).expect_err("blank"),
+        blank
+    );
+
+    assert_eq!(MessageBody::new("a").expect("1").as_str(), "a");
+    // The text is kept as given, never trimmed.
+    assert_eq!(
+        MessageBody::new(" a\r\n").expect("untrimmed").as_str(),
+        " a\r\n"
+    );
+    // The limit counts characters, not bytes: 65 536 two-byte characters are accepted.
+    assert_eq!(text(65_536).as_str().chars().count(), 65_536);
+    assert_eq!(
+        MessageBody::new(&"é".repeat(65_537)).expect_err("too long"),
+        Error::InvalidBody {
+            problem: BodyProblem::TooLong { chars: 65_537 }
+        }
+    );
+    assert!(MessageBody::new(&"a".repeat(65_536)).is_ok());
+}
+
+#[test]
+fn message_body_debug_shows_the_length_never_the_text() {
+    let body = MessageBody::new("très secret é").expect("body");
+    let debug = format!("{body:?}");
+    let pretty = format!("{body:#?}");
+    for shown in [&debug, &pretty] {
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("13"), "{shown}");
+    }
+    let request = ReviewRequest::RequestChanges { body };
+    assert!(!format!("{request:?}").contains("secret"));
+}
+
+#[test]
+fn a_review_request_knows_its_verdict() {
+    let body = MessageBody::new("x").expect("body");
+    assert_eq!(
+        ReviewRequest::Approve { body: None }.verdict(),
+        Verdict::Approve
+    );
+    assert_eq!(
+        ReviewRequest::Approve {
+            body: Some(body.clone())
+        }
+        .verdict(),
+        Verdict::Approve
+    );
+    assert_eq!(
+        ReviewRequest::RequestChanges { body }.verdict(),
+        Verdict::RequestChanges
+    );
+}
+
+#[tokio::test]
+async fn current_user_requests_user_and_decodes_the_example() {
+    let (url, heads) = scripted_server(1, |_, _, _| http_answer("200 OK", "", USER_EXAMPLE));
+    let user = client_at(&url).current_user().await.expect("user");
+    assert_eq!(user.login, "octocat");
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(head.starts_with("GET /user HTTP/1.1\r\n"), "{head}");
+}
+
+#[tokio::test]
+async fn pull_requests_its_path_and_decodes_the_example() {
+    let (url, heads) = scripted_server(1, |_, _, _| http_answer("200 OK", "", PULL_EXAMPLE));
+    let pull = client_at(&url)
+        .pull(&name("octocat/Hello-World"), pr(1347))
+        .await
+        .expect("pull");
+    assert_eq!(pull.number.get(), 1347);
+    assert_eq!(pull.head_sha.as_str(), HEAD_SHA);
+    assert_eq!(pull.mergeable, Mergeable::Yes);
+    assert_eq!(pull.state, PrState::Open { draft: false });
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(
+        head.starts_with("GET /repos/octocat/Hello-World/pulls/1347 HTTP/1.1\r\n"),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn pull_with_a_bad_sha_or_unknown_state_is_unexpected_and_shows_no_token() {
+    for bad in [
+        PULL_EXAMPLE.replacen(HEAD_SHA, "nothex", 1),
+        PULL_EXAMPLE.replace(r#""state": "open""#, r#""state": "weird""#),
+        "[]".to_owned(),
+    ] {
+        let (url, _heads) = scripted_server(1, move |_, _, _| http_answer("200 OK", "", &bad));
+        let error = client_at(&url)
+            .pull(&name("a/b"), pr(1))
+            .await
+            .expect_err("bad");
+        assert!(
+            matches!(error, Error::UnexpectedResponse { .. }),
+            "{error:?}"
+        );
+        assert_no_secret(&error);
+    }
+}
+
+#[tokio::test]
+async fn reviews_follow_pages_drop_pending_and_keep_the_first_of_a_repeated_id() {
+    let (url, heads) = scripted_server(2, |index, _, _| match index {
+        0 => http_answer(
+            "200 OK",
+            &next_page("/repos/alice/notes/pulls/7/reviews"),
+            &format!(
+                "[{},{}]",
+                review_json(1, "APPROVED"),
+                review_json(2, "PENDING")
+            ),
+        ),
+        _ => http_answer(
+            "200 OK",
+            "",
+            &format!(
+                "[{},{},{}]",
+                review_json(1, "CHANGES_REQUESTED"),
+                review_json(3, "COMMENTED"),
+                review_json(4, "DISMISSED")
+            ),
+        ),
+    });
+    let reviews = client_at(&url)
+        .reviews(&name("alice/notes"), pr(7))
+        .await
+        .expect("reviews");
+    let got: Vec<(u64, ReviewState)> = reviews.iter().map(|r| (r.id, r.state)).collect();
+    assert_eq!(
+        got,
+        [
+            (1, ReviewState::Approved),
+            (3, ReviewState::Commented),
+            (4, ReviewState::Dismissed)
+        ]
+    );
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(
+        request_line(&head).starts_with("GET /repos/alice/notes/pulls/7/reviews?per_page=100 "),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn reviews_decode_the_example_and_an_unknown_state_is_unexpected() {
+    let (url, _heads) = scripted_server(1, |_, _, _| http_answer("200 OK", "", REVIEWS_EXAMPLE));
+    let reviews = client_at(&url)
+        .reviews(&name("a/b"), pr(1))
+        .await
+        .expect("reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state, ReviewState::Approved);
+
+    let weird = REVIEWS_EXAMPLE.replace("APPROVED", "WEIRD");
+    let (url, _heads) = scripted_server(1, move |_, _, _| http_answer("200 OK", "", &weird));
+    let error = client_at(&url)
+        .reviews(&name("a/b"), pr(1))
+        .await
+        .expect_err("unknown state");
+    assert!(
+        matches!(error, Error::UnexpectedResponse { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn comments_follow_pages_and_keep_the_first_of_a_repeated_id() {
+    let (url, heads) = scripted_server(2, |index, _, _| match index {
+        0 => http_answer(
+            "200 OK",
+            &next_page("/repos/alice/notes/issues/7/comments"),
+            &format!("[{},{}]", comment_json(1), comment_json(2)),
+        ),
+        _ => http_answer(
+            "200 OK",
+            "",
+            &format!("[{},{}]", comment_json(2), comment_json(3)),
+        ),
+    });
+    let comments = client_at(&url)
+        .comments(&name("alice/notes"), pr(7))
+        .await
+        .expect("comments");
+    let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [1, 2, 3]);
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(
+        request_line(&head).starts_with("GET /repos/alice/notes/issues/7/comments?per_page=100 "),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn comments_decode_the_documented_example() {
+    let (url, _heads) = scripted_server(1, |_, _, _| http_answer("200 OK", "", COMMENTS_EXAMPLE));
+    let comments = client_at(&url)
+        .comments(&name("a/b"), pr(1))
+        .await
+        .expect("comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(
+        (comments[0].author.as_str(), comments[0].body.as_str()),
+        ("octocat", "Me too")
+    );
+}
+
+#[tokio::test]
+async fn pull_files_follow_pages_and_keep_the_first_of_a_repeated_filename() {
+    let (url, heads) = scripted_server(2, |index, _, _| match index {
+        0 => http_answer(
+            "200 OK",
+            &next_page("/repos/alice/notes/pulls/7/files"),
+            &format!("[{},{}]", file_json("a.rs"), file_json("b.rs")),
+        ),
+        _ => http_answer(
+            "200 OK",
+            "",
+            &format!("[{},{}]", file_json("b.rs"), file_json("c.rs")),
+        ),
+    });
+    let files = client_at(&url)
+        .pull_files(&name("alice/notes"), pr(7))
+        .await
+        .expect("files");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["a.rs", "b.rs", "c.rs"]);
+    assert!(
+        files
+            .iter()
+            .all(|f| f.status == FileStatus::Modified && f.patch.is_none())
+    );
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(
+        request_line(&head).starts_with("GET /repos/alice/notes/pulls/7/files?per_page=100 "),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn pull_files_decode_the_example_and_an_unknown_status_is_unexpected() {
+    let (url, _heads) = scripted_server(1, |_, _, _| http_answer("200 OK", "", FILES_EXAMPLE));
+    let files = client_at(&url)
+        .pull_files(&name("a/b"), pr(1))
+        .await
+        .expect("files");
+    assert_eq!(
+        (files[0].path.as_str(), files[0].status),
+        ("file1.txt", FileStatus::Added)
+    );
+    assert!(files[0].patch.is_some());
+
+    let weird = FILES_EXAMPLE.replace(r#""added""#, r#""weird""#);
+    let (url, _heads) = scripted_server(1, move |_, _, _| http_answer("200 OK", "", &weird));
+    let error = client_at(&url)
+        .pull_files(&name("a/b"), pr(1))
+        .await
+        .expect_err("unknown status");
+    assert!(
+        matches!(error, Error::UnexpectedResponse { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn files_with_an_empty_patch_or_none_have_no_patch() {
+    let body = r#"[{"filename":"bin.png","status":"added","additions":0,"deletions":0},
+        {"filename":"r.txt","previous_filename":"q.txt","status":"renamed","additions":0,"deletions":0,"patch":""}]"#;
+    let (url, _heads) = scripted_server(1, move |_, _, _| http_answer("200 OK", "", body));
+    let files = client_at(&url)
+        .pull_files(&name("a/b"), pr(1))
+        .await
+        .expect("files");
+    assert_eq!(files[0].patch, None);
+    assert_eq!(files[1].patch, None);
+    assert_eq!(files[1].previous_path.as_deref(), Some("q.txt"));
+}
+
+#[tokio::test]
+async fn post_comment_sends_the_body_and_decodes_a_201() {
+    let (url, heads) = scripted_server(1, |_, _, _| {
+        http_answer("201 Created", "", COMMENT_CREATED_EXAMPLE)
+    });
+    let body = MessageBody::new("Me too\nline é \"quoted\"").expect("body");
+    let comment = client_at(&url)
+        .post_comment(&name("alice/notes"), pr(7), &body)
+        .await
+        .expect("comment");
+    assert_eq!((comment.id, comment.body.as_str()), (1, "Me too"));
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    let (line, rest) = head.split_once("\r\n").expect("line");
+    assert_eq!(line, "POST /repos/alice/notes/issues/7/comments HTTP/1.1");
+    let (headers, sent) = rest.split_once("\r\n\r\n").expect("body");
+    let lower = headers.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: application/json"),
+        "{headers}"
+    );
+    assert!(lower.contains("authorization: bearer "), "{headers}");
+    let json: serde_json::Value = serde_json::from_str(sent).expect("json body");
+    assert_eq!(
+        json,
+        serde_json::json!({"body": "Me too\nline é \"quoted\""})
+    );
+}
+
+#[tokio::test]
+async fn post_comment_expects_201_and_a_decodable_comment() {
+    for (status, body) in [
+        ("200 OK", COMMENT_CREATED_EXAMPLE),
+        ("204 No Content", ""),
+        ("201 Created", "{}"),
+        ("201 Created", "not json"),
+    ] {
+        let (url, _heads) = scripted_server(1, move |_, _, _| http_answer(status, "", body));
+        let error = client_at(&url)
+            .post_comment(&name("a/b"), pr(1), &text(3))
+            .await
+            .expect_err(status);
+        assert!(
+            matches!(error, Error::UnexpectedResponse { .. }),
+            "{status}: {error:?}"
+        );
+        assert_no_secret(&error);
+    }
+}
+
+#[tokio::test]
+async fn post_review_decodes_a_200_and_sends_the_body_of_each_request() {
+    let (url, heads) = scripted_server(1, |_, _, _| {
+        http_answer("200 OK", "", REVIEW_CREATED_EXAMPLE)
+    });
+    let request = ReviewRequest::RequestChanges {
+        body: MessageBody::new("fix it").expect("body"),
+    };
+    let review = client_at(&url)
+        .post_review(&name("alice/notes"), pr(7), &sha(), &request)
+        .await
+        .expect("review");
+    assert_eq!(
+        (review.id, review.state),
+        (80, ReviewState::ChangesRequested)
+    );
+    let head = heads.recv_timeout(Duration::from_secs(5)).expect("head");
+    assert!(
+        head.starts_with("POST /repos/alice/notes/pulls/7/reviews HTTP/1.1\r\n"),
+        "{head}"
+    );
+    let sent = head.split_once("\r\n\r\n").expect("body").1;
+    let json: serde_json::Value = serde_json::from_str(sent).expect("json");
+    assert_eq!(
+        json,
+        serde_json::json!({"event": "REQUEST_CHANGES", "body": "fix it", "commit_id": HEAD_SHA})
+    );
+}
+
+#[tokio::test]
+async fn post_review_expects_200_and_a_submitted_review() {
+    let pending = review_json(5, "PENDING");
+    for (status, body) in [
+        ("201 Created", REVIEW_CREATED_EXAMPLE.to_owned()),
+        ("200 OK", pending),
+        ("200 OK", "{}".to_owned()),
+    ] {
+        let label = format!("{status} {body}");
+        let (url, _heads) = scripted_server(1, move |_, _, _| http_answer(status, "", &body));
+        let error = client_at(&url)
+            .post_review(
+                &name("a/b"),
+                pr(1),
+                &sha(),
+                &ReviewRequest::Approve { body: None },
+            )
+            .await
+            .expect_err(&label);
+        assert!(
+            matches!(error, Error::UnexpectedResponse { .. }),
+            "{label}: {error:?}"
+        );
+        assert_no_secret(&error);
+    }
+}
+
+fn post_requests(fake: &FakeGitHub) -> Vec<gh_fake::RecordedRequest> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.method == Method::Post)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_fake_records_the_json_body_of_a_comment() {
+    let fake = FakeGitHub::start(state_with_token(vec![]))
+        .await
+        .expect("fake");
+    // The fake has no route for it in this wave (404): only what the client sent is checked.
+    let _ = client_for(&fake, SECRET)
+        .post_comment(
+            &name("alice/notes"),
+            pr(7),
+            &MessageBody::new("hello").expect("body"),
+        )
+        .await;
+    let posts = post_requests(&fake);
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert_eq!(posts[0].path, "/repos/alice/notes/issues/7/comments");
+    assert_eq!(posts[0].body, Some(serde_json::json!({"body": "hello"})));
+}
+
+#[tokio::test]
+async fn post_review_bodies_carry_event_commit_id_and_omit_a_missing_body() {
+    let fake = FakeGitHub::start(state_with_token(vec![]))
+        .await
+        .expect("fake");
+    let client = client_for(&fake, SECRET);
+    let words = MessageBody::new("looks good").expect("body");
+    let requests = [
+        ReviewRequest::Approve { body: None },
+        ReviewRequest::Approve {
+            body: Some(words.clone()),
+        },
+        ReviewRequest::RequestChanges { body: words },
+    ];
+    for request in &requests {
+        // 404 from the fake in this wave: only what the client sent is checked.
+        let _ = client
+            .post_review(&name("alice/notes"), pr(7), &sha(), request)
+            .await;
+    }
+    let posts = post_requests(&fake);
+    assert_eq!(posts.len(), 3, "{posts:?}");
+    assert!(
+        posts
+            .iter()
+            .all(|p| p.path == "/repos/alice/notes/pulls/7/reviews")
+    );
+    assert_eq!(
+        posts[0].body,
+        Some(serde_json::json!({"event": "APPROVE", "commit_id": HEAD_SHA}))
+    );
+    assert!(
+        posts[0]
+            .body
+            .as_ref()
+            .is_some_and(|b| b.get("body").is_none()),
+        "body must be omitted, not null: {:?}",
+        posts[0].body
+    );
+    assert_eq!(
+        posts[1].body,
+        Some(serde_json::json!({"event": "APPROVE", "body": "looks good", "commit_id": HEAD_SHA}))
+    );
+    assert_eq!(
+        posts[2].body,
+        Some(
+            serde_json::json!({"event": "REQUEST_CHANGES", "body": "looks good", "commit_id": HEAD_SHA})
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_long_body_is_sent_whole() {
+    let fake = FakeGitHub::start(state_with_token(vec![]))
+        .await
+        .expect("fake");
+    let _ = client_for(&fake, SECRET)
+        .post_comment(&name("alice/notes"), pr(1), &text(MAX_BODY_CHARS))
+        .await;
+    let posts = post_requests(&fake);
+    let sent = posts[0]
+        .body
+        .as_ref()
+        .and_then(|b| b["body"].as_str())
+        .expect("body");
+    assert_eq!(sent.chars().count(), MAX_BODY_CHARS);
+}
+
+/// Failures injected by the fake on every new route: (label, method, path).
+fn new_routes() -> Vec<(&'static str, Method, &'static str)> {
+    vec![
+        ("current_user", Method::Get, "/user"),
+        ("pull", Method::Get, "/repos/alice/notes/pulls/7"),
+        ("reviews", Method::Get, "/repos/alice/notes/pulls/7/reviews"),
+        (
+            "comments",
+            Method::Get,
+            "/repos/alice/notes/issues/7/comments",
+        ),
+        (
+            "pull_files",
+            Method::Get,
+            "/repos/alice/notes/pulls/7/files",
+        ),
+        (
+            "post_comment",
+            Method::Post,
+            "/repos/alice/notes/issues/7/comments",
+        ),
+        (
+            "post_review",
+            Method::Post,
+            "/repos/alice/notes/pulls/7/reviews",
+        ),
+    ]
+}
+
+async fn call(client: &Client, label: &str) -> Result<(), Error> {
+    let repo = name("alice/notes");
+    let body = MessageBody::new("text").expect("body");
+    let approve = ReviewRequest::Approve { body: None };
+    match label {
+        "current_user" => client.current_user().await.map(drop),
+        "pull" => client.pull(&repo, pr(7)).await.map(drop),
+        "reviews" => client.reviews(&repo, pr(7)).await.map(drop),
+        "comments" => client.comments(&repo, pr(7)).await.map(drop),
+        "pull_files" => client.pull_files(&repo, pr(7)).await.map(drop),
+        "post_comment" => client.post_comment(&repo, pr(7), &body).await.map(drop),
+        "post_review" => client
+            .post_review(&repo, pr(7), &sha(), &approve)
+            .await
+            .map(drop),
+        other => panic!("unknown route {other}"),
+    }
+}
+
+#[tokio::test]
+async fn every_new_route_classifies_401_403_404_422_429_and_500_without_the_token() {
+    let fake = FakeGitHub::start(state_with_token(vec![]))
+        .await
+        .expect("fake");
+    let client = client_for(&fake, SECRET);
+    for (label, method, path) in new_routes() {
+        for (response, check) in [
+            (
+                FailureResponse::Unauthorized,
+                (|e: &Error| *e == Error::Unauthorized) as fn(&Error) -> bool,
+            ),
+            (
+                FailureResponse::Forbidden {
+                    message: "Repository was archived so is read-only.".into(),
+                },
+                |e| matches!(e, Error::Forbidden { message } if message == "Repository was archived so is read-only."),
+            ),
+            (FailureResponse::NotFound, |e| *e == Error::NotFound),
+            (
+                FailureResponse::Unprocessable {
+                    message: "Validation Failed".into(),
+                },
+                |e| matches!(e, Error::Unprocessable { message } if message.starts_with("Validation Failed")),
+            ),
+            (FailureResponse::RateLimited, |e| {
+                matches!(e, Error::RateLimited { reset_at: Some(_) })
+            }),
+            (FailureResponse::ServerError, |e| {
+                matches!(e, Error::Api { status: 500, .. })
+            }),
+        ] {
+            fake.with_state(|s| {
+                s.failures = vec![Failure {
+                    method,
+                    path: path.into(),
+                    response: response.clone(),
+                    remaining: Some(1),
+                }];
+            });
+            let error = call(&client, label).await.expect_err(label);
+            assert!(check(&error), "{label} {response:?}: {error:?}");
+            assert_no_secret(&error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_publication_is_not_retried() {
+    let fake = FakeGitHub::start(state_with_token(vec![]))
+        .await
+        .expect("fake");
+    let client = client_for(&fake, SECRET);
+    for (label, path) in [
+        ("post_comment", "/repos/alice/notes/issues/7/comments"),
+        ("post_review", "/repos/alice/notes/pulls/7/reviews"),
+    ] {
+        fake.with_state(|s| {
+            s.failures = vec![Failure {
+                method: Method::Post,
+                path: path.into(),
+                response: FailureResponse::ServerError,
+                remaining: None,
+            }];
+        });
+        let before = post_requests(&fake).len();
+        assert!(call(&client, label).await.is_err());
+        assert_eq!(post_requests(&fake).len(), before + 1, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn an_echoed_token_is_masked_in_publication_errors() {
+    for (status, kind) in [
+        ("403 Forbidden", "forbidden"),
+        ("422 Unprocessable Entity", "unprocessable"),
+    ] {
+        let body = format!(r#"{{"message":"token {SECRET} refused","errors":["{SECRET}"]}}"#);
+        let (url, _heads) = scripted_server(2, move |_, _, _| http_answer(status, "", &body));
+        let client = client_at(&url);
+        let comment = client
+            .post_comment(&name("a/b"), pr(1), &text(2))
+            .await
+            .expect_err(kind);
+        let review = client
+            .post_review(
+                &name("a/b"),
+                pr(1),
+                &sha(),
+                &ReviewRequest::Approve { body: None },
+            )
+            .await
+            .expect_err(kind);
+        for error in [comment, review] {
+            assert_no_secret(&error);
+            assert!(error.to_string().contains("***"), "{kind}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_network_failure_on_publication_is_a_network_error_without_the_token() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let client = client_at(&format!("http://127.0.0.1:{port}"));
+    let error = client
+        .post_comment(&name("a/b"), pr(1), &text(2))
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, Error::Network { .. }), "{error:?}");
+    assert_no_secret(&error);
 }

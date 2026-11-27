@@ -65,3 +65,20 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   mémoire ».
 - 2026-11-27 11:06 — plateforme (sonnet) — essai sccache — a marché : installation sans root avec somme vérifiée,
   4 cas mesurés, recommandation chiffrée, nettoyage ; ~8 min — a manqué : rien.
+
+- 2026-11-27 12:55 — dev[tui-detail], dev[tui-diff], dev[tui-compose] (sonnet) — #6, #7, #8 ; #7 et #8 lancés en
+  avance pendant les corrections de #6 (fichiers disjoints) — a marché : rouge vu par écran bouchon, 13 à 23
+  contre-épreuves chacun, choix à valider listés et tous tranchés « conformes » par la relecture Spec ; ~11 à 13 min —
+  a manqué : #6 comptait des caractères au lieu de colonnes (texte CJK tronqué) et #7 relisait tout le patch à chaque
+  image, deux défauts que seul relecteur Standards a vus ; tests unitaires souvent écrits après le code (rouge
+  remplacé par mutation, honnêtement signalé).
+- 2026-11-27 12:55 — qa (sonnet) — #6, #7 — a marché : table critère → test, mutations en worktree jetable, test
+  manquant ajouté (n au-delà du dernier fichier) ; ~4 min — a manqué : rien.
+- 2026-11-27 12:55 — relecteur Spec / Standards (opus) — #6, #7, #8 — a marché : Standards trouve à chaque fois un
+  majeur réel (largeur, coût de rendu, double publication sur réponse illisible) ; Spec trouve le conseil « Esc, r »
+  qui faisait perdre le texte (trou de l'ADR, pas du code) ; diff à deux points repéré et contourné ; ~2 min — a
+  manqué : rien. Leçon pour la session principale : donner un diff à trois points (ou base = fusion) quand la branche
+  part d'avant les corrections de la précédente.
+- 2026-11-27 12:55 — architecte (opus) — trous de l'ADR 0003 § 4 trouvés par les relectures de #8 — a marché : trois
+  choix tranchés avec option écartée, plomberie ui.rs testée (tests vus échouer), consigne précise pour le dev ; ~6 min
+  — a manqué : a touché pr_detail.rs (obligé par le match), d'où un conflit d'import à la fusion de main.

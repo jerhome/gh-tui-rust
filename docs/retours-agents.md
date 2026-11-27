@@ -82,3 +82,10 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
 - 2026-11-27 12:55 — architecte (opus) — trous de l'ADR 0003 § 4 trouvés par les relectures de #8 — a marché : trois
   choix tranchés avec option écartée, plomberie ui.rs testée (tests vus échouer), consigne précise pour le dev ; ~6 min
   — a manqué : a touché pr_detail.rs (obligé par le match), d'où un conflit d'import à la fusion de main.
+
+- 2026-11-27 13:22 — dev[tui-review] (sonnet), dev[tui-editor] (opus), qa (sonnet), relecteur ×2 (opus) — #10 et #9 — a
+  marché : #10 OK dès le 1er tour (qa a ajouté 2 tests demandés par les relectures, par SendMessage en cours de
+  route) ; #9 complet en ~15 min avec 11 mutations ; limite de temps respectée par tous — a manqué : **un test de
+  dev[tui-editor] a lancé le vrai `vi`** (Ctrl-E sans éditeur choisi dans un test existant), bloqué 4 min 30 ; le
+  harnais force désormais `EDITOR=/nonexistent/ghu-editor`. dev[tui-review] a modifié `tests/comment.rs` hors de sa
+  liste (nécessaire, signalé). Code souvent écrit avant les tests (rouge vu par mutation).

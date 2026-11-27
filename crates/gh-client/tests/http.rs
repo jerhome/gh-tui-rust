@@ -867,6 +867,11 @@ async fn fake_repo_and_pulls_with_a_bad_token_are_unauthorized_without_the_token
 // Successes are served by the scripted server from the documented examples (the fake has no routes for them in
 // this wave); failures come from the fake's injected `Failure`, which is applied before routing; the JSON bodies
 // of the POSTs are read from the fake's `requests()`, recorded before routing.
+//
+// Fixtures are copies of the OpenAPI examples (components.examples, rest-api-description): pull.json = pull-request,
+// reviews.json = pull-request-review-items, review_created.json = pull-request-review, issue_comments.json =
+// issue-comment-items, comment_created.json = issue-comment, files.json = diff-entry-items, user.json =
+// private-user-response-with-public-and-private-profile-information.
 
 const PULL_EXAMPLE: &str = include_str!("fixtures/pull.json");
 const REVIEWS_EXAMPLE: &str = include_str!("fixtures/reviews.json");
@@ -1030,11 +1035,18 @@ async fn pull_requests_its_path_and_decodes_the_example() {
     );
 }
 
+/// The documented pull request with one field edited, as a body.
+fn pull_edited(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(PULL_EXAMPLE).expect("example is JSON");
+    edit(&mut value);
+    value.to_string()
+}
+
 #[tokio::test]
 async fn pull_with_a_bad_sha_or_unknown_state_is_unexpected_and_shows_no_token() {
     for bad in [
-        PULL_EXAMPLE.replacen(HEAD_SHA, "nothex", 1),
-        PULL_EXAMPLE.replace(r#""state": "open""#, r#""state": "weird""#),
+        pull_edited(|pull| pull["head"]["sha"] = "nothex".into()),
+        pull_edited(|pull| pull["state"] = "weird".into()),
         "[]".to_owned(),
     ] {
         let (url, _heads) = scripted_server(1, move |_, _, _| http_answer("200 OK", "", &bad));

@@ -89,3 +89,13 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   dev[tui-editor] a lancé le vrai `vi`** (Ctrl-E sans éditeur choisi dans un test existant), bloqué 4 min 30 ; le
   harnais force désormais `EDITOR=/nonexistent/ghu-editor`. dev[tui-review] a modifié `tests/comment.rs` hors de sa
   liste (nécessaire, signalé). Code souvent écrit avant les tests (rouge vu par mutation).
+
+- 2026-11-27 16:14 — qa, relecteur ×3 (opus), dev[tui-editor] ×2, architecte (opus) ×3, plateforme —
+  fin de #9, lots L2 à L5 de la 0.1 — a marché : qa et deux relectures en parallèle, puis corrections et 2e tour en
+  ~15 min ; Standards a trouvé le jeton hérité par l'éditeur ; architecte L5 a vu que l'aide de la saisie est
+  inaccessible (`?` s'écrit) ; plateforme : workflow propre (actionlint, garde-fou sur le contenu des archives) — a
+  manqué : **relecteur Spec a lu le ticket sur le vrai GitHub** (`gh issue view`, lecture seule, méthode du repo,
+  contre la consigne « jamais le vrai GitHub ») : la consigne doit dire « lecture du tracker permise » ; plateforme
+  n'a pas su que `workflow_dispatch` exige le workflow sur la branche par défaut (essai à blanc ajouté au push de
+  `wip-*-release`) ; le hook guard-ghu bloque toute commande contenant « ghu » (cargo build -p ghu compris) :
+  préfixer `GH_TOKEN=ghu-fake-token`.

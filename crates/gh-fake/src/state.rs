@@ -55,8 +55,11 @@ impl State {
     /// The PR `number` of `owner/repo` (owner and repo compared case-insensitively), for tests to edit its
     /// reviews, comments and files. `None` if there is none. Never panics.
     pub fn pull_mut(&mut self, owner: &str, repo: &str, number: u64) -> Option<&mut Pull> {
-        let _ = (owner, repo, number);
-        todo!("ADR 0003, wave 1: dev[fake]")
+        self.pulls.iter_mut().find(|p| {
+            p.number == number
+                && p.owner.eq_ignore_ascii_case(owner)
+                && p.repo.eq_ignore_ascii_case(repo)
+        })
     }
 
     /// Demo data (also used by the `gh-fake` binary). Fictional names only. Must keep what #2's tests rely on:
@@ -106,11 +109,91 @@ impl State {
             p.updated_at = format!("2026-03-{day:02}T12:30:00Z");
             p
         };
+        let mut first = pr(1, "Fix typo in the README", "bob", PullState::Open, 3);
+        first.body = Some(DEMO_BODY.to_owned());
+        first.files = vec![
+            PullFile::modified(
+                "README.md",
+                "@@ -1,3 +1,3 @@\n # Notes\n-Plain-text notess and snippets\n+Plain-text notes and snippets\n See the guide.\n",
+            ),
+            PullFile {
+                filename: "docs/guide.md".into(),
+                previous_filename: None,
+                status: FileStatus::Added,
+                additions: 2,
+                deletions: 0,
+                patch: Some("@@ -0,0 +1,2 @@\n+# Guide\n+Start here.\n".into()),
+            },
+            PullFile {
+                filename: "scripts/export.sh".into(),
+                previous_filename: None,
+                status: FileStatus::Removed,
+                additions: 0,
+                deletions: 2,
+                patch: Some("@@ -1,2 +0,0 @@\n-#!/bin/sh\n-echo export\n".into()),
+            },
+            PullFile {
+                filename: "docs/tags.md".into(),
+                previous_filename: Some("docs/labels.md".into()),
+                status: FileStatus::Renamed,
+                additions: 0,
+                deletions: 0,
+                patch: None,
+            },
+            PullFile {
+                filename: "assets/logo.png".into(),
+                previous_filename: None,
+                status: FileStatus::Added,
+                additions: 0,
+                deletions: 0,
+                patch: None,
+            },
+        ];
+        let demo_review =
+            |id: u64, author: &str, review_state: ReviewState, body: &str| PullReview {
+                id,
+                author: Some(author.to_owned()),
+                state: review_state,
+                body: body.to_owned(),
+                submitted_at: (review_state != ReviewState::Pending)
+                    .then(|| format!("2026-03-0{}T10:00:00Z", id - 100)),
+                commit_id: first.head_sha.clone(),
+            };
+        first.reviews = vec![
+            demo_review(101, "carol", ReviewState::Approved, ""),
+            demo_review(
+                102,
+                "dave",
+                ReviewState::ChangesRequested,
+                "Please also fix the title.",
+            ),
+            demo_review(
+                103,
+                "erin",
+                ReviewState::Commented,
+                "Looks fine, one question about the guide.",
+            ),
+            demo_review(104, "alice", ReviewState::Pending, "Draft of my review"),
+        ];
+        first.comments = vec![
+            IssueComment {
+                id: 201,
+                author: Some("carol".into()),
+                body: "Thanks, good catch.".into(),
+                created_at: "2026-03-02T09:00:00Z".into(),
+            },
+            IssueComment {
+                id: 202,
+                author: Some("bob".into()),
+                body: "Fixed in the last commit.".into(),
+                created_at: "2026-03-03T09:30:00Z".into(),
+            },
+        ];
         let mut draft = pr(2, "WIP: full-text search", "carol", PullState::Open, 5);
         draft.draft = true;
         draft.head = "search".into();
         state.pulls = vec![
-            pr(1, "Fix typo in the README", "bob", PullState::Open, 3),
+            first,
             draft,
             pr(
                 3,
@@ -121,9 +204,20 @@ impl State {
             ),
             pr(4, "Add a tag index", "carol", PullState::Merged, 10),
         ];
+        // Own PR of alice in a repo of someone else, a PR of an archived repo, a PR with conflicts.
+        let mut own = Pull::new("bob", "shared-tools", 1, "Add a lint script", "alice");
+        own.head = "lint".into();
+        let mut frozen = Pull::new("acme", "legacy-site", 1, "Update the footer", "bob");
+        frozen.head = "footer".into();
+        let mut conflicting = Pull::new("acme", "widgets", 1, "Rename the Button widget", "carol");
+        conflicting.head = "rename-button".into();
+        conflicting.mergeable = Some(false);
+        state.pulls.extend([own, frozen, conflicting]);
         state
     }
 }
+
+const DEMO_BODY: &str = "# Fix typo\n\nThe README said **notess**. Changes:\n\n- fix the typo\n- add a guide\n- drop the export script\n\n```sh\ngrep -n notess README.md\n```\n\n![screenshot](https://example.com/shot.png)\n\n<b>Raw HTML</b> stays as text.";
 
 /// The signed-in user (`GET /user`, owner of repos).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,8 +371,18 @@ impl PullFile {
     /// A [`FileStatus::Modified`] file without previous name, whose `additions` and `deletions` count the lines
     /// of `patch` starting with `+` / `-` (lines split as `str::lines`).
     pub fn modified(filename: &str, patch: &str) -> Self {
-        let _ = (filename, patch);
-        todo!("ADR 0003, wave 1: dev[fake]")
+        let count = |sign: char| {
+            u64::try_from(patch.lines().filter(|l| l.starts_with(sign)).count())
+                .expect("a line count fits in u64")
+        };
+        Self {
+            filename: filename.to_owned(),
+            previous_filename: None,
+            status: FileStatus::Modified,
+            additions: count('+'),
+            deletions: count('-'),
+            patch: Some(patch.to_owned()),
+        }
     }
 }
 

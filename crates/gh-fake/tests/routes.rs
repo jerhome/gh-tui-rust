@@ -961,3 +961,843 @@ async fn demo_state_has_the_data_the_later_tickets_need() {
         .collect();
     assert!(authors.len() >= 2);
 }
+
+// ---- ADR 0003 (#6-#10): detail, files, reviews, comments, and the two POST routes ----
+
+use gh_fake::{FileStatus, IssueComment, PullFile, PullReview, ReviewState};
+use serde_json::json;
+
+const NOW: &str = "2026-05-05T05:05:05Z";
+const SHA_OK: &str = "0123456789abcdef0123456789abcdef01234567";
+
+async fn post(fake: &FakeGitHub, path: &str, body: &Value) -> Response {
+    client()
+        .post(format!("{}{path}", fake.base_url()))
+        .header("Authorization", format!("Bearer {DEFAULT_TOKEN}"))
+        .json(body)
+        .send()
+        .await
+        .expect("send")
+}
+
+async fn authed(fake: &FakeGitHub, path: &str) -> Response {
+    get(fake, path, Some(DEFAULT_TOKEN)).await
+}
+
+fn review(id: u64, author: Option<&str>, state: ReviewState, body: &str) -> PullReview {
+    PullReview {
+        id,
+        author: author.map(str::to_owned),
+        state,
+        body: body.to_owned(),
+        submitted_at: (state != ReviewState::Pending).then(|| "2026-04-01T08:00:00Z".to_owned()),
+        commit_id: SHA_OK.to_owned(),
+    }
+}
+
+/// alice/notes: #1 (bob, open, files, reviews, comments), #2 (alice, open), #3 (bob, closed); acme/frozen
+/// (archived): #1 (bob, open); bob/tools: nothing. "now" and "next_id" are the ADR defaults except "now".
+async fn adr_fake() -> FakeGitHub {
+    let mut frozen = Repo::new("acme", "frozen");
+    frozen.archived = true;
+    let fake = start(vec![
+        Repo::new("alice", "notes"),
+        frozen,
+        Repo::new("bob", "tools"),
+    ])
+    .await;
+    fake.with_state(|s| {
+        s.now = NOW.to_owned();
+        let mut one = Pull::new("alice", "notes", 1, "One", "bob");
+        one.head_sha = SHA_OK.to_owned();
+        one.files = vec![
+            PullFile::modified("src/a.rs", "@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d\n"),
+            PullFile {
+                filename: "new.png".into(),
+                previous_filename: None,
+                status: FileStatus::Added,
+                additions: 0,
+                deletions: 0,
+                patch: None,
+            },
+            PullFile {
+                filename: "moved.txt".into(),
+                previous_filename: Some("old.txt".into()),
+                status: FileStatus::Renamed,
+                additions: 0,
+                deletions: 0,
+                patch: None,
+            },
+        ];
+        one.reviews = vec![
+            review(10, Some("carol"), ReviewState::Approved, "LGTM"),
+            review(11, None, ReviewState::Commented, ""),
+            review(12, Some("alice"), ReviewState::Pending, "draft"),
+        ];
+        one.comments = vec![
+            IssueComment {
+                id: 22,
+                author: Some("dave".into()),
+                body: "second".into(),
+                created_at: "2026-04-01T09:00:00Z".into(),
+            },
+            IssueComment {
+                id: 21,
+                author: None,
+                body: "first".into(),
+                created_at: "2026-04-01T08:00:00Z".into(),
+            },
+        ];
+        let own = Pull::new("alice", "notes", 2, "Mine", "alice");
+        let mut closed = Pull::new("alice", "notes", 3, "Closed", "bob");
+        closed.state = PullState::Closed;
+        let frozen_pr = Pull::new("acme", "frozen", 1, "Frozen", "bob");
+        s.pulls = vec![one, own, closed, frozen_pr];
+    });
+    fake
+}
+
+const PR1: &str = "/repos/alice/notes/pulls/1";
+
+#[tokio::test]
+async fn adr_routes_require_authentication() {
+    let fake = adr_fake().await;
+    for path in [
+        "/user",
+        PR1,
+        "/repos/alice/notes/pulls/1/files",
+        "/repos/alice/notes/pulls/1/reviews",
+        "/repos/alice/notes/issues/1/comments",
+    ] {
+        assert_eq!(get(&fake, path, None).await.status(), 401, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn user_route_serves_the_signed_in_user() {
+    let fake = adr_fake().await;
+    let resp = authed(&fake, "/user").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["login"], "alice");
+    assert_eq!(json["id"], 1);
+    assert_eq!(json["type"], "User");
+}
+
+#[tokio::test]
+async fn pull_detail_has_github_shape_and_computed_counts() {
+    let fake = adr_fake().await;
+    let resp = authed(&fake, "/repos/Alice/NOTES/pulls/1").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["number"], 1);
+    assert_eq!(json["title"], "One");
+    assert_eq!(json["user"]["login"], "bob");
+    assert_eq!(json["head"]["sha"], SHA_OK);
+    assert_eq!(json["head"]["label"], "alice:feature");
+    assert_eq!(json["base"]["ref"], "main");
+    assert_eq!(json["mergeable"], true);
+    assert_eq!(json["mergeable_state"], "clean");
+    assert_eq!(json["merged"], false);
+    assert_eq!(json["additions"], 2);
+    assert_eq!(json["deletions"], 1);
+    assert_eq!(json["changed_files"], 3);
+    assert_eq!(json["comments"], 2);
+    assert_eq!(json["base"]["repo"]["full_name"], "alice/notes");
+    assert_eq!(json["base"]["repo"]["archived"], false);
+}
+
+#[tokio::test]
+async fn pull_detail_mergeable_states_merged_flag_and_archived_repo() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| {
+        s.pull_mut("alice", "notes", 2).unwrap().mergeable = None;
+        s.pull_mut("alice", "notes", 1).unwrap().mergeable = Some(false);
+        s.pull_mut("alice", "notes", 3).unwrap().state = PullState::Merged;
+    });
+    let unknown: Value = authed(&fake, "/repos/alice/notes/pulls/2")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(unknown["mergeable"].is_null());
+    assert_eq!(unknown["mergeable_state"], "unknown");
+    let dirty: Value = authed(&fake, PR1).await.json().await.unwrap();
+    assert_eq!(dirty["mergeable"], false);
+    assert_eq!(dirty["mergeable_state"], "dirty");
+    let merged: Value = authed(&fake, "/repos/alice/notes/pulls/3")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(merged["merged"], true);
+    assert!(!merged["merged_at"].is_null());
+    let frozen: Value = authed(&fake, "/repos/acme/frozen/pulls/1")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(frozen["base"]["repo"]["archived"], true);
+}
+
+#[tokio::test]
+async fn the_seven_routes_answer_404_for_a_missing_repo_or_pull() {
+    let fake = adr_fake().await;
+    let body = json!({"body": "hi", "event": "APPROVE"});
+    for prefix in ["/repos/alice/nope", "/repos/nobody/notes"] {
+        for tail in [
+            "/pulls/1",
+            "/pulls/1/files",
+            "/pulls/1/reviews",
+            "/issues/1/comments",
+        ] {
+            let path = format!("{prefix}{tail}");
+            let resp = authed(&fake, &path).await;
+            assert_eq!(resp.status(), 404, "GET {path}");
+            let json: Value = resp.json().await.unwrap();
+            assert_eq!(json["message"], "Not Found");
+        }
+        assert_eq!(
+            post(&fake, &format!("{prefix}/issues/1/comments"), &body)
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            post(&fake, &format!("{prefix}/pulls/1/reviews"), &body)
+                .await
+                .status(),
+            404
+        );
+    }
+    for number in ["99", "0", "x"] {
+        for tail in ["", "/files", "/reviews"] {
+            let path = format!("/repos/alice/notes/pulls/{number}{tail}");
+            assert_eq!(authed(&fake, &path).await.status(), 404, "GET {path}");
+        }
+        let comments = format!("/repos/alice/notes/issues/{number}/comments");
+        assert_eq!(
+            authed(&fake, &comments).await.status(),
+            404,
+            "GET {comments}"
+        );
+        assert_eq!(post(&fake, &comments, &body).await.status(), 404);
+        let reviews = format!("/repos/alice/notes/pulls/{number}/reviews");
+        assert_eq!(post(&fake, &reviews, &body).await.status(), 404);
+    }
+    assert!(fake.with_state(|s| s.pulls.iter().all(|p| p.comments.len() <= 2)));
+}
+
+#[tokio::test]
+async fn files_are_served_in_order_with_optional_keys() {
+    let fake = adr_fake().await;
+    let json: Value = authed(&fake, "/repos/alice/notes/pulls/1/files")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let files = json.as_array().unwrap();
+    let names: Vec<_> = files
+        .iter()
+        .map(|f| f["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["src/a.rs", "new.png", "moved.txt"]);
+    assert_eq!(files[0]["status"], "modified");
+    assert_eq!(files[0]["additions"], 2);
+    assert_eq!(files[0]["deletions"], 1);
+    assert_eq!(files[0]["changes"], 3);
+    assert!(files[0]["patch"].as_str().unwrap().starts_with("@@ -1,2"));
+    assert!(files[0].get("previous_filename").is_none());
+    assert_eq!(files[1]["status"], "added");
+    assert!(files[1].get("patch").is_none(), "patch key absent");
+    assert_eq!(files[2]["status"], "renamed");
+    assert_eq!(files[2]["previous_filename"], "old.txt");
+}
+
+#[tokio::test]
+async fn reviews_are_served_chronologically_with_github_states() {
+    let fake = adr_fake().await;
+    let json: Value = authed(&fake, "/repos/alice/notes/pulls/1/reviews")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let list = json.as_array().unwrap();
+    let ids: Vec<_> = list.iter().map(|r| r["id"].as_u64().unwrap()).collect();
+    assert_eq!(ids, [10, 11, 12]);
+    assert_eq!(list[0]["state"], "APPROVED");
+    assert_eq!(list[0]["user"]["login"], "carol");
+    assert_eq!(list[0]["body"], "LGTM");
+    assert_eq!(list[0]["commit_id"], SHA_OK);
+    assert_eq!(list[0]["submitted_at"], "2026-04-01T08:00:00Z");
+    assert!(list[1]["user"].is_null());
+    assert_eq!(list[1]["state"], "COMMENTED");
+    assert_eq!(list[2]["state"], "PENDING");
+    assert!(
+        list[2].get("submitted_at").is_none(),
+        "Pending has no submitted_at"
+    );
+}
+
+#[tokio::test]
+async fn comments_are_served_sorted_by_id() {
+    let fake = adr_fake().await;
+    let json: Value = authed(&fake, "/repos/alice/notes/issues/1/comments")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let list = json.as_array().unwrap();
+    assert_eq!(list[0]["id"], 21);
+    assert_eq!(list[1]["id"], 22);
+    assert!(list[0]["user"].is_null());
+    assert_eq!(list[1]["user"]["login"], "dave");
+    assert_eq!(list[1]["body"], "second");
+    assert_eq!(list[1]["created_at"], "2026-04-01T09:00:00Z");
+}
+
+#[tokio::test]
+async fn the_three_lists_are_paginated_with_link_headers() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| {
+        s.max_per_page = 2;
+        let p = s.pull_mut("alice", "notes", 1).unwrap();
+        for n in 0..3 {
+            p.files
+                .push(PullFile::modified(&format!("extra{n}.rs"), "+x"));
+            p.reviews
+                .push(review(100 + n, Some("carol"), ReviewState::Commented, "x"));
+            p.comments.push(IssueComment {
+                id: 100 + n,
+                author: Some("dave".into()),
+                body: "x".into(),
+                created_at: "2026-04-02T00:00:00Z".into(),
+            });
+        }
+    });
+    for (path, total, key) in [
+        ("/repos/alice/notes/pulls/1/files", 6usize, "filename"),
+        ("/repos/alice/notes/pulls/1/reviews", 6, "id"),
+        ("/repos/alice/notes/issues/1/comments", 5, "id"),
+    ] {
+        let first = authed(&fake, &format!("{path}?per_page=100")).await;
+        let link = header(&first, "link");
+        assert!(
+            link.contains(&format!(
+                "http://{}{path}?per_page=2&page=2>; rel=\"next\"",
+                fake.addr()
+            )),
+            "{link}"
+        );
+        let mut seen = Vec::new();
+        let mut page = 1;
+        loop {
+            let resp = authed(&fake, &format!("{path}?page={page}")).await;
+            let more = resp.headers().contains_key("link");
+            let json: Value = resp.json().await.unwrap();
+            let items = json.as_array().unwrap();
+            assert!(items.len() <= 2);
+            seen.extend(items.iter().map(|i| i[key].to_string()));
+            if !more {
+                break;
+            }
+            page += 1;
+        }
+        assert_eq!(seen.len(), total, "{path}");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), total, "{path}: no duplicate");
+    }
+    let default = authed(&fake, "/repos/alice/notes/pulls/1/files").await;
+    assert!(
+        header(&default, "link").contains("per_page=2"),
+        "capped by max_per_page"
+    );
+}
+
+// -- POST comments --
+
+#[tokio::test]
+async fn posting_a_comment_adds_it_and_the_next_get_shows_it() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| s.next_id = 500);
+    let path = "/repos/alice/notes/issues/1/comments";
+    let resp = post(&fake, path, &json!({"body": "  hello **you**\n"})).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: Value = resp.json().await.unwrap();
+    assert_eq!(created["id"], 500);
+    assert_eq!(created["user"]["login"], "alice");
+    assert_eq!(created["body"], "  hello **you**\n", "sent as is");
+    assert_eq!(created["created_at"], NOW);
+
+    let list: Value = authed(&fake, path).await.json().await.unwrap();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[2]["id"], 500);
+    let second = post(&fake, path, &json!({"body": "again"})).await;
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(second["id"], 501, "next_id incremented");
+    assert_eq!(fake.with_state(|s| s.next_id), 502);
+    let updated = fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().updated_at.clone());
+    assert_eq!(updated, NOW);
+    let detail: Value = authed(&fake, PR1).await.json().await.unwrap();
+    assert_eq!(detail["comments"], 4);
+
+    let posts: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == Method::Post)
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0].path, path);
+    assert_eq!(posts[0].body, Some(json!({"body": "  hello **you**\n"})));
+}
+
+#[tokio::test]
+async fn a_comment_is_accepted_on_a_closed_pull() {
+    let fake = adr_fake().await;
+    let resp = post(
+        &fake,
+        "/repos/alice/notes/issues/3/comments",
+        &json!({"body": "late"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_missing_non_string_or_blank_comment_body_is_422() {
+    let fake = adr_fake().await;
+    let path = "/repos/alice/notes/issues/1/comments";
+    for body in [
+        json!({}),
+        json!({"body": 3}),
+        json!({"body": null}),
+        json!({"body": ""}),
+        json!({"body": " \n\t "}),
+        json!([1]),
+    ] {
+        let resp = post(&fake, path, &body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let json: Value = resp.json().await.unwrap();
+        assert_eq!(json["message"], "Validation Failed", "{body}");
+        assert!(json["errors"].is_array());
+    }
+    let raw = client()
+        .post(format!("{}{path}", fake.base_url()))
+        .header("Authorization", format!("Bearer {DEFAULT_TOKEN}"))
+        .body("not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().comments.len()),
+        2
+    );
+    assert_eq!(fake.with_state(|s| s.next_id), 1_000_000, "no id consumed");
+}
+
+#[tokio::test]
+async fn posting_to_an_archived_repo_is_403_and_changes_nothing() {
+    let fake = adr_fake().await;
+    let resp = post(
+        &fake,
+        "/repos/acme/frozen/issues/1/comments",
+        &json!({"body": "x"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["message"], "Repository was archived so is read-only.");
+    let resp = post(
+        &fake,
+        "/repos/acme/frozen/pulls/1/reviews",
+        &json!({"event": "APPROVE"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["message"], "Repository was archived so is read-only.");
+    assert_eq!(
+        fake.with_state(|s| {
+            let p = s.pull_mut("acme", "frozen", 1).unwrap();
+            p.comments.len() + p.reviews.len()
+        }),
+        0
+    );
+    assert_eq!(fake.with_state(|s| s.next_id), 1_000_000);
+}
+
+// -- POST reviews --
+
+async fn review_errors(fake: &FakeGitHub, path: &str, body: Value) -> Vec<String> {
+    let resp = post(fake, path, &body).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["message"], "Unprocessable Entity");
+    assert!(json["documentation_url"].is_string());
+    json["errors"]
+        .as_array()
+        .expect("errors array")
+        .iter()
+        .map(|e| e.as_str().expect("string error").to_owned())
+        .collect()
+}
+
+const R1: &str = "/repos/alice/notes/pulls/1/reviews";
+const R_OWN: &str = "/repos/alice/notes/pulls/2/reviews";
+const R_CLOSED: &str = "/repos/alice/notes/pulls/3/reviews";
+
+fn assert_nothing_added(fake: &FakeGitHub) {
+    let total = fake.with_state(|s| s.pulls.iter().map(|p| p.reviews.len()).sum::<usize>());
+    assert_eq!(total, 3, "only the three seeded reviews");
+    assert_eq!(fake.with_state(|s| s.next_id), 1_000_000);
+}
+
+#[tokio::test]
+async fn review_on_a_pull_that_is_not_open_is_422_first() {
+    let fake = adr_fake().await;
+    // Also an unknown event and a bad commit: the closed pull is reported alone.
+    let errors = review_errors(&fake, R_CLOSED, json!({"event": "NOPE", "commit_id": "zz"})).await;
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("not open"), "{errors:?}");
+    fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().state = PullState::Merged);
+    let errors = review_errors(&fake, R1, json!({"event": "APPROVE"})).await;
+    assert!(errors[0].contains("not open"), "{errors:?}");
+    assert_nothing_added(&fake);
+}
+
+#[tokio::test]
+async fn approve_or_request_changes_on_an_own_pull_is_422() {
+    let fake = adr_fake().await;
+    let approve = review_errors(&fake, R_OWN, json!({"event": "APPROVE"})).await;
+    assert_eq!(approve, ["Can not approve your own pull request"]);
+    let request = review_errors(&fake, R_OWN, json!({"event": "REQUEST_CHANGES"})).await;
+    assert_eq!(
+        request,
+        ["Can not request changes on your own pull request"],
+        "own comes before the body rule"
+    );
+    // Case-insensitive author match.
+    fake.with_state(|s| s.pull_mut("alice", "notes", 2).unwrap().author = Some("ALICE".into()));
+    let approve = review_errors(&fake, R_OWN, json!({"event": "APPROVE"})).await;
+    assert_eq!(approve, ["Can not approve your own pull request"]);
+    assert_nothing_added(&fake);
+}
+
+#[tokio::test]
+async fn comment_on_an_own_pull_is_accepted() {
+    let fake = adr_fake().await;
+    let resp = post(
+        &fake,
+        R_OWN,
+        &json!({"event": "COMMENT", "body": "note to self"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["state"], "COMMENTED");
+}
+
+#[tokio::test]
+async fn request_changes_or_comment_without_a_non_blank_body_is_422() {
+    let fake = adr_fake().await;
+    for event in ["REQUEST_CHANGES", "COMMENT"] {
+        for body in [
+            json!({"event": event}),
+            json!({"event": event, "body": ""}),
+            json!({"event": event, "body": " \n "}),
+            json!({"event": event, "body": 5}),
+        ] {
+            let errors = review_errors(&fake, R1, body.clone()).await;
+            assert_eq!(errors.len(), 1, "{body}");
+            assert!(errors[0].contains("body"), "{errors:?}");
+        }
+    }
+    // Body rule comes before the pending-review rule.
+    // PR 1 holds a Pending review of alice: the body rule is still reported first.
+    let errors = review_errors(&fake, R1, json!({"event": "COMMENT"})).await;
+    assert!(errors[0].contains("body"));
+    assert_nothing_added(&fake);
+}
+
+#[tokio::test]
+async fn a_second_pending_review_of_the_user_is_422() {
+    let fake = adr_fake().await;
+    // PR 1 already holds a Pending review of alice (seeded).
+    for body in [
+        json!({}),
+        json!({"event": "APPROVE"}),
+        json!({"event": "NOPE"}),
+    ] {
+        let errors = review_errors(&fake, R1, body).await;
+        assert_eq!(
+            errors,
+            ["User can only have one pending review per pull request"]
+        );
+    }
+    assert_nothing_added(&fake);
+}
+
+#[tokio::test]
+async fn a_pending_review_of_someone_else_does_not_block() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| {
+        let p = s.pull_mut("alice", "notes", 1).unwrap();
+        p.reviews.retain(|r| r.state != ReviewState::Pending);
+        p.reviews
+            .push(review(13, Some("carol"), ReviewState::Pending, ""));
+    });
+    let resp = post(&fake, R1, &json!({"event": "APPROVE"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_unknown_event_is_422_and_precedes_the_commit_check() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().reviews.clear());
+    for event in [json!("NOPE"), json!("approve"), json!(7), json!("PENDING")] {
+        let errors = review_errors(&fake, R1, json!({"event": event, "commit_id": "zz"})).await;
+        assert_eq!(errors.len(), 1, "{event}");
+        assert!(errors[0].contains("event"), "{errors:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_commit_id_that_is_not_40_or_64_hex_digits_is_422() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().reviews.clear());
+    let sha64 = "a".repeat(64);
+    for bad in [
+        json!("abc"),
+        json!(&SHA_OK[..39]),
+        json!(format!("{SHA_OK}0")),
+        json!("g".repeat(40)),
+        json!(&sha64[..63]),
+        json!(12),
+        json!(""),
+    ] {
+        let errors = review_errors(&fake, R1, json!({"event": "APPROVE", "commit_id": bad})).await;
+        assert_eq!(errors.len(), 1, "{bad}");
+        assert!(errors[0].contains("commit_id"), "{errors:?}");
+    }
+    for good in [SHA_OK, sha64.as_str()] {
+        let resp = post(
+            &fake,
+            R1,
+            &json!({"event": "COMMENT", "body": "ok", "commit_id": good}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{good}");
+    }
+}
+
+#[tokio::test]
+async fn publishing_reviews_records_state_commit_body_and_time() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| {
+        s.pull_mut("alice", "notes", 1).unwrap().reviews.clear();
+        s.next_id = 700;
+    });
+    let sha64 = "b".repeat(64);
+    let cases = [
+        (json!({"event": "APPROVE"}), "APPROVED", "", SHA_OK),
+        (
+            json!({"event": "REQUEST_CHANGES", "body": "fix it", "commit_id": sha64}),
+            "CHANGES_REQUESTED",
+            "fix it",
+            sha64.as_str(),
+        ),
+        (
+            json!({"event": "COMMENT", "body": " remark "}),
+            "COMMENTED",
+            " remark ",
+            SHA_OK,
+        ),
+    ];
+    for (i, (body, state, text, commit)) in cases.iter().enumerate() {
+        let resp = post(&fake, R1, body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+        let json: Value = resp.json().await.unwrap();
+        assert_eq!(json["id"], 700 + i as u64);
+        assert_eq!(json["state"], *state);
+        assert_eq!(json["body"], *text);
+        assert_eq!(json["commit_id"], *commit);
+        assert_eq!(json["user"]["login"], "alice");
+        assert_eq!(json["submitted_at"], NOW);
+    }
+    let list: Value = authed(&fake, R1).await.json().await.unwrap();
+    let ids: Vec<_> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids, [700, 701, 702], "visible at the next GET, in order");
+    assert_eq!(fake.with_state(|s| s.next_id), 703);
+    let posts: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == Method::Post)
+        .collect();
+    assert_eq!(posts.len(), 3);
+    assert_eq!(posts[1].body.as_ref().unwrap()["body"], "fix it");
+    assert_eq!(posts[1].body.as_ref().unwrap()["event"], "REQUEST_CHANGES");
+}
+
+#[tokio::test]
+async fn a_review_without_event_is_created_pending_and_blocks_the_next() {
+    let fake = adr_fake().await;
+    fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().reviews.clear());
+    let resp = post(&fake, R1, &json!({"body": "wip"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["state"], "PENDING");
+    assert_eq!(json["id"], 1_000_000);
+    assert_eq!(json["body"], "wip");
+    assert!(json.get("submitted_at").is_none());
+    let list: Value = authed(&fake, R1).await.json().await.unwrap();
+    assert_eq!(list[0]["state"], "PENDING");
+    let errors = review_errors(&fake, R1, json!({"event": "APPROVE"})).await;
+    assert_eq!(
+        errors,
+        ["User can only have one pending review per pull request"]
+    );
+}
+
+// -- state helpers and demo --
+
+#[test]
+fn pull_mut_finds_a_pull_case_insensitively() {
+    let mut state = State::new(user());
+    state.pulls = vec![Pull::new("Alice", "Notes", 4, "t", "bob")];
+    assert_eq!(state.pull_mut("alice", "notes", 4).unwrap().title, "t");
+    state.pull_mut("ALICE", "NOTES", 4).unwrap().title = "edited".into();
+    assert_eq!(state.pulls[0].title, "edited");
+    assert!(state.pull_mut("alice", "notes", 5).is_none());
+    assert!(state.pull_mut("alice", "other", 4).is_none());
+}
+
+#[test]
+fn pull_file_modified_counts_plus_and_minus_lines() {
+    let file = PullFile::modified(
+        "a.rs",
+        "@@ -1,3 +1,4 @@\n ctx\n-old1\n-old2\n+new1\n+new2\n+new3\n ctx",
+    );
+    assert_eq!(file.filename, "a.rs");
+    assert_eq!(file.status, FileStatus::Modified);
+    assert_eq!((file.additions, file.deletions), (3, 2));
+    assert!(file.previous_filename.is_none());
+    assert!(file.patch.as_deref().unwrap().starts_with("@@"));
+    let empty = PullFile::modified("b.rs", "");
+    assert_eq!((empty.additions, empty.deletions), (0, 0));
+}
+
+#[tokio::test]
+async fn demo_state_has_the_pr_detail_data() {
+    let fake = FakeGitHub::start(State::demo()).await.unwrap();
+    let notes: Value = authed(&fake, "/repos/alice/notes/pulls?state=all&per_page=100")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        notes.as_array().unwrap().len(),
+        4,
+        "alice/notes keeps its four PRs"
+    );
+
+    let detail: Value = authed(&fake, PR1).await.json().await.unwrap();
+    let body = detail["body"].as_str().expect("markdown body");
+    for needle in ["# ", "**", "- ", "```", "![", "<"] {
+        assert!(body.contains(needle), "body lacks {needle:?}");
+    }
+    assert_eq!(detail["comments"], 2);
+    assert_eq!(detail["changed_files"], 5);
+
+    let reviews: Value = authed(&fake, "/repos/alice/notes/pulls/1/reviews")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let reviews = reviews.as_array().unwrap();
+    let find = |state: &str| {
+        reviews
+            .iter()
+            .filter(|r| r["state"] == state)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(find("APPROVED")[0]["user"]["login"], "carol");
+    assert_eq!(find("CHANGES_REQUESTED")[0]["user"]["login"], "dave");
+    assert!(!find("COMMENTED")[0]["body"].as_str().unwrap().is_empty());
+    assert_eq!(find("PENDING")[0]["user"]["login"], "alice");
+
+    let files: Value = authed(&fake, "/repos/alice/notes/pulls/1/files")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let files = files.as_array().unwrap();
+    let status = |s: &str| files.iter().filter(|f| f["status"] == s).count();
+    assert!(status("modified") >= 1 && status("added") >= 1 && status("removed") >= 1);
+    assert!(
+        files
+            .iter()
+            .any(|f| f["status"] == "renamed" && f.get("patch").is_none() && f["changes"] == 0)
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.get("patch").is_none() && f["status"] != "renamed"),
+        "binary"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f["status"] == "modified" && f.get("patch").is_some())
+    );
+
+    let comments: Value = authed(&fake, "/repos/alice/notes/issues/1/comments")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(comments.as_array().unwrap().len(), 2);
+
+    // Own PR, archived repo, conflicting PR.
+    let own: Value = authed(&fake, "/repos/bob/shared-tools/pulls?per_page=100")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        own.as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["user"]["login"] == "alice" && p["state"] == "open")
+    );
+    let legacy: Value = authed(&fake, "/repos/acme/legacy-site/pulls?per_page=100")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let legacy_pr = legacy
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["state"] == "open")
+        .expect("open PR");
+    let number = legacy_pr["number"].as_u64().unwrap();
+    let detail: Value = authed(&fake, &format!("/repos/acme/legacy-site/pulls/{number}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["base"]["repo"]["archived"], true);
+    let conflicts = fake.with_state(|s| {
+        s.pulls
+            .iter()
+            .any(|p| p.mergeable == Some(false) && p.state == PullState::Open)
+    });
+    assert!(conflicts);
+}

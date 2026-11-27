@@ -20,6 +20,9 @@ Mis à jour le 2026-11-27 16:35.
 
 ## Prochaine action
 
+**⚠ À RAPPELER À L'UTILISATEUR EN DÉBUT DE SESSION** (demande du 2026-11-27, 16:37) : l'essai réel de la 0.1 (L8,
+fiche de la rc.1 ci-dessous) n'a pas été fait ; le lui proposer avant tout autre travail.
+
 main = 8561fff (poussé) : #9 fusionné, L2 à L7 faits (L6 qa OK : 6 passages sans échec, CI verte sur les 3 OS ;
 L7 relecteur : 2 tours, flux de release corrigé). Workflow de release : un tag `vX.Y.Z-rc.N` construit et publie une
 pré-release ; le tag final `vX.Y.Z` sur le même commit **republie les archives de la rc sans recompiler** (job

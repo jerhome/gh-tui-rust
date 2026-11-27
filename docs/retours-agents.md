@@ -50,3 +50,18 @@ Format : `AAAA-MM-JJ HH:MM — agent (modèle) — tâche — ce qui a marché /
   fiche qa : mutations dans un worktree avec son propre CARGO_TARGET_DIR.
 - 2026-11-26 17:07 — relecteur ×2 (opus) — #3/#4/#5 — a marché : licence MPL-2.0 trouvée dans Cargo.lock, nom périmé
   dans un message, fichier non synchronisé, duplications que #6-#10 auraient recopiées — a manqué : rien.
+
+- 2026-11-27 11:06 — relecteur (opus) — ADR 0003 : 1re relecture (4 majeurs, 7 mineurs) puis 2e courte (3 mineurs) —
+  a marché : tous les « à confirmer » tranchés d'après le code avec lignes citées, test existant cassé par la vague 2 vu
+  (pull_list.rs:252), CRLF, lots non indépendants ; ~5 min puis ~1,5 min — a manqué : rien (la consigne lui demandait
+  d'écrire un fichier, ce que sa fiche interdit : il l'a refusé à juste titre ; erreur de consigne).
+- 2026-11-27 11:06 — architecte (opus) — amendements puis acceptation + vague 0 — a marché : 11 constats corrigés en
+  ~4 min, choix argumenté pour M3, vague 0 compilable avec règle dead_code claire, lots détaillés avec critères ; ~8 min
+  — a manqué : rien.
+- 2026-11-27 11:06 — dev[fake] et dev[client] (sonnet) — vague 1 en worktrees, sccache — a marché : rouge vu par
+  bouchons inertes (pas todo!()), 15 et 23 contre-épreuves, points ouverts listés ; ~8 et ~9 min — a manqué :
+  **dev[client] a écrit les fixtures « OpenAPI » de mémoire** (aucun outil web), signalé honnêtement. Piste : la
+  consigne (ou l'architecte en vague 0) fournit les exemples téléchargés ; ou la fiche dev dit « jamais de fixture de
+  mémoire ».
+- 2026-11-27 11:06 — plateforme (sonnet) — essai sccache — a marché : installation sans root avec somme vérifiée,
+  4 cas mesurés, recommandation chiffrée, nettoyage ; ~8 min — a manqué : rien.

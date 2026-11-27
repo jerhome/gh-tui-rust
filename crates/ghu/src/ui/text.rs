@@ -159,6 +159,43 @@ fn styled_run(rest: &str, before: Option<char>) -> Option<(usize, &str, Style)> 
     ))
 }
 
+/// Screen columns taken by `text` as a whole (0 for a combining mark, 2 for CJK and most emoji; a joined emoji
+/// sequence counts as the one emoji it draws).
+pub(crate) fn width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Whether `next` belongs to the cluster `cluster` already started: a zero-width character (combining mark,
+/// variation selector) or any character after a zero-width joiner. The one rule of cluster cutting, for wrapping
+/// and for windowing by columns: a cluster is never cut in two.
+pub(crate) fn continues(cluster: &str, next: char) -> bool {
+    cluster.ends_with('\u{200d}') || {
+        let mut buffer = [0; 4];
+        width(next.encode_utf8(&mut buffer)) == 0
+    }
+}
+
+/// The clusters of `text` with their width in columns. A zero-width cluster can only be the first one.
+pub(crate) fn clusters(text: &str) -> impl Iterator<Item = (&str, usize)> {
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        chars.next()?;
+        let mut end = text.len();
+        while let Some(&(at, c)) = chars.peek() {
+            if continues(&text[start..at], c) {
+                chars.next();
+            } else {
+                end = at;
+                break;
+            }
+        }
+        let cluster = &text[start..end];
+        start = end;
+        Some((cluster, width(cluster)))
+    })
+}
+
 /// Deterministic generator for tests (xorshift64, fixed seed): no dependency, same inputs on every run.
 #[cfg(test)]
 pub(crate) struct Rng(pub(crate) u64);
@@ -430,6 +467,34 @@ mod tests {
             }
             let cleaned = clean(&text);
             assert_eq!(clean(&cleaned), cleaned, "clean is idempotent for {text:?}");
+        }
+    }
+
+    #[test]
+    fn clusters_keep_marks_and_joined_characters_with_their_base() {
+        let family = "👨\u{200d}\u{1f469}";
+        let text = format!("e\u{301}x{family}日\u{200d}");
+        let found: Vec<(&str, usize)> = clusters(&text).collect();
+        assert_eq!(
+            found,
+            [("e\u{301}", 1), ("x", 1), (family, 2), ("日\u{200d}", 2)]
+        );
+        assert_eq!(clusters("").count(), 0);
+        // A zero-width first cluster, then the text.
+        assert_eq!(
+            clusters("\u{301}a").collect::<Vec<_>>(),
+            [("\u{301}", 0), ("a", 1)]
+        );
+    }
+
+    #[test]
+    fn clusters_rebuild_the_text_whatever_it_is() {
+        const POOL: [&str; 8] = ["a", "é", "日", "😀", "\u{301}", "\u{200d}", " ", "\u{fe0f}"];
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for _ in 0..2000 {
+            let text: String = (0..rng.below(14)).map(|_| POOL[rng.below(8)]).collect();
+            let rebuilt: String = clusters(&text).map(|(cluster, _)| cluster).collect();
+            assert_eq!(rebuilt, text);
         }
     }
 }

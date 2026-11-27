@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Paragraph};
 use super::compose::{ComposeScreen, Kind, Target};
 use super::diff::DiffScreen;
 use super::keys::{self, Binding, HelpRow};
-use super::text::{clean, markdown};
+use super::text::{self, clean, markdown};
 use super::{Draft, Flow, Outcome, RequestId, Shared, Signal, View, error_message};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -497,7 +497,6 @@ struct Cluster {
 
 /// The clusters of `line`, each with the style of its first character.
 fn clusters(line: &Line<'_>) -> Vec<Cluster> {
-    let width_of = |text: &str| Span::raw(text).width();
     let mut cells: Vec<Cluster> = Vec::new();
     for span in &line.spans {
         let style = line.style.patch(span.style);
@@ -505,14 +504,14 @@ fn clusters(line: &Line<'_>) -> Vec<Cluster> {
             let mut buf = [0; 4];
             let one = &*c.encode_utf8(&mut buf);
             match cells.last_mut() {
-                Some(last) if last.text.ends_with('\u{200d}') || width_of(one) == 0 => {
+                Some(last) if text::continues(&last.text, c) => {
                     last.text.push(c);
-                    last.width = width_of(&last.text);
+                    last.width = text::width(&last.text);
                 }
                 _ => cells.push(Cluster {
                     text: one.to_owned(),
                     style,
-                    width: width_of(one),
+                    width: text::width(one),
                 }),
             }
         }

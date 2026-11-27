@@ -5,12 +5,16 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK};
 use url::Url;
 
 use crate::link::next_link;
 use crate::status::{classify, redact};
-use crate::wire::{decode_pulls, decode_repo, decode_repos};
+use crate::wire::{
+    decode_comment, decode_comments, decode_files, decode_pull_detail, decode_pulls, decode_repo,
+    decode_repos, decode_review, decode_reviews, decode_user,
+};
 use crate::{
     Affiliation, ApiBase, Comment, CommitSha, Error, FileChange, MessageBody, PrNumber, PullDetail,
     PullFilter, PullRequest, Repo, RepoName, Result, Review, ReviewRequest, Token, User,
@@ -173,7 +177,9 @@ impl Client {
     /// Errors: [`crate::Error::Unauthorized`], [`crate::Error::RateLimited`], [`crate::Error::Forbidden`],
     /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`], [`crate::Error::Api`].
     pub async fn current_user(&self) -> Result<User> {
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.route("/user")?;
+        let (_, body) = self.get(url, MAX_BODY_BYTES).await?;
+        decode_user(&body, self.token.expose()).map_err(|e| redact(e, self.token.expose()))
     }
 
     /// `GET /repos/{owner}/{repo}/pulls/{number}`: one PR with its detail fields (#6).
@@ -182,8 +188,14 @@ impl Client {
     /// [`crate::Error::UnexpectedResponse`] also for an invalid `head.sha`, number 0, a bad timestamp or an
     /// unknown state.
     pub async fn pull(&self, repo: &RepoName, number: PrNumber) -> Result<PullDetail> {
-        let _ = (repo, number);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.route(&format!(
+            "/repos/{}/{}/pulls/{}",
+            repo.owner(),
+            repo.name(),
+            number.get()
+        ))?;
+        let (_, body) = self.get(url, MAX_BODY_BYTES).await?;
+        decode_pull_detail(&body, self.token.expose()).map_err(|e| redact(e, self.token.expose()))
     }
 
     /// `GET /repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100`, every page, chronological order; `PENDING`
@@ -191,8 +203,10 @@ impl Client {
     ///
     /// Errors: as [`Client::pull`]; an unknown `state` is [`crate::Error::UnexpectedResponse`].
     pub async fn reviews(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<Review>> {
-        let _ = (repo, number);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.list_route(repo, number, "pulls", "reviews")?;
+        let secret = self.token.expose();
+        self.paginate(url, |body| decode_reviews(body, secret), |review| review.id)
+            .await
     }
 
     /// `GET /repos/{owner}/{repo}/issues/{number}/comments?per_page=100`: the conversation Comments of the PR,
@@ -200,8 +214,14 @@ impl Client {
     ///
     /// Errors: as [`Client::pull`].
     pub async fn comments(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<Comment>> {
-        let _ = (repo, number);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.list_route(repo, number, "issues", "comments")?;
+        let secret = self.token.expose();
+        self.paginate(
+            url,
+            |body| decode_comments(body, secret),
+            |comment| comment.id,
+        )
+        .await
     }
 
     /// `GET /repos/{owner}/{repo}/pulls/{number}/files?per_page=100`, every page, GitHub's order (deduplicated by
@@ -209,8 +229,14 @@ impl Client {
     ///
     /// Errors: as [`Client::pull`]; an unknown `status` is [`crate::Error::UnexpectedResponse`].
     pub async fn pull_files(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<FileChange>> {
-        let _ = (repo, number);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.list_route(repo, number, "pulls", "files")?;
+        let secret = self.token.expose();
+        self.paginate(
+            url,
+            |body| decode_files(body, secret),
+            |file| file.path.clone(),
+        )
+        .await
     }
 
     /// `POST /repos/{owner}/{repo}/issues/{number}/comments` with `{"body": body}` (#8). Expects 201 and returns
@@ -225,8 +251,15 @@ impl Client {
         number: PrNumber,
         body: &MessageBody,
     ) -> Result<Comment> {
-        let _ = (repo, number, body);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.route(&format!(
+            "/repos/{}/{}/issues/{}/comments",
+            repo.owner(),
+            repo.name(),
+            number.get()
+        ))?;
+        let json = serde_json::json!({ "body": body.as_str() });
+        let answer = self.post(url, &json, StatusCode::CREATED).await?;
+        decode_comment(&answer, self.token.expose()).map_err(|e| redact(e, self.token.expose()))
     }
 
     /// `POST /repos/{owner}/{repo}/pulls/{number}/reviews` with
@@ -244,8 +277,26 @@ impl Client {
         commit: &CommitSha,
         review: &ReviewRequest,
     ) -> Result<Review> {
-        let _ = (repo, number, commit, review);
-        todo!("ADR 0003, wave 1: dev[client]")
+        let url = self.route(&format!(
+            "/repos/{}/{}/pulls/{}/reviews",
+            repo.owner(),
+            repo.name(),
+            number.get()
+        ))?;
+        let mut json = serde_json::Map::new();
+        let (event, text) = match review {
+            ReviewRequest::Approve { body } => ("APPROVE", body.as_ref()),
+            ReviewRequest::RequestChanges { body } => ("REQUEST_CHANGES", Some(body)),
+        };
+        json.insert("event".to_owned(), event.into());
+        if let Some(text) = text {
+            json.insert("body".to_owned(), text.as_str().into());
+        }
+        json.insert("commit_id".to_owned(), commit.as_str().into());
+        let answer = self
+            .post(url, &serde_json::Value::Object(json), StatusCode::OK)
+            .await?;
+        decode_review(&answer, self.token.expose()).map_err(|e| redact(e, self.token.expose()))
     }
 
     /// Reads a list route page after page, following `next` links, and keeps the first of the items that share a
@@ -282,6 +333,24 @@ impl Client {
         }
     }
 
+    /// `/repos/{owner}/{repo}/{section}/{number}/{list}?per_page=100`, the first page of a list route.
+    fn list_route(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        section: &str,
+        list: &str,
+    ) -> Result<Url> {
+        let mut url = self.route(&format!(
+            "/repos/{}/{}/{section}/{}/{list}",
+            repo.owner(),
+            repo.name(),
+            number.get()
+        ))?;
+        url.query_pairs_mut().append_pair("per_page", "100");
+        Ok(url)
+    }
+
     /// `{base}{path}`.
     fn route(&self, path: &str) -> Result<Url> {
         Url::parse(&format!("{}{path}", self.base.as_str()))
@@ -302,12 +371,51 @@ impl Client {
 
     /// One GET; a non-2xx answer becomes the matching [`Error`].
     async fn get(&self, url: Url, limit: usize) -> Result<(HeaderMap, Vec<u8>)> {
-        let mut response = self
+        let response = self
             .http
             .get(url)
             .send()
             .await
             .map_err(|e| self.network(&e))?;
+        let (status, headers, body) = self.read(response, limit).await?;
+        if status.is_success() {
+            Ok((headers, body))
+        } else {
+            Err(self.classified(status, &headers, &body))
+        }
+    }
+
+    /// One POST of a JSON body, never retried. Only `expected` is a success: any other 2xx status is an
+    /// [`Error::UnexpectedResponse`], a non-2xx one the matching [`Error`]. Returns the answer body.
+    async fn post(
+        &self,
+        url: Url,
+        json: &serde_json::Value,
+        expected: StatusCode,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .http
+            .post(url)
+            .json(json)
+            .send()
+            .await
+            .map_err(|e| self.network(&e))?;
+        let (status, headers, body) = self.read(response, MAX_BODY_BYTES).await?;
+        if status == expected {
+            Ok(body)
+        } else if status.is_success() {
+            Err(self.unexpected(&format!("expected HTTP {expected}, got {status}")))
+        } else {
+            Err(self.classified(status, &headers, &body))
+        }
+    }
+
+    /// Reads a whole answer, at most `limit` bytes.
+    async fn read(
+        &self,
+        mut response: reqwest::Response,
+        limit: usize,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let status = response.status();
         let headers = response.headers().clone();
         let mut body = Vec::new();
@@ -317,14 +425,14 @@ impl Client {
             }
             body.extend_from_slice(&chunk);
         }
-        if status.is_success() {
-            Ok((headers, body))
-        } else {
-            Err(redact(
-                classify(status, &headers, &body, self.token.expose()),
-                self.token.expose(),
-            ))
-        }
+        Ok((status, headers, body))
+    }
+
+    fn classified(&self, status: StatusCode, headers: &HeaderMap, body: &[u8]) -> Error {
+        redact(
+            classify(status, headers, body, self.token.expose()),
+            self.token.expose(),
+        )
     }
 
     fn unexpected(&self, message: &str) -> Error {

@@ -272,18 +272,20 @@ pub struct CommitSha(String);
 impl CommitSha {
     /// `None` for anything else (uppercase, other length, non-hex, surrounding spaces). Pure, never panics.
     pub fn parse(text: &str) -> Option<Self> {
-        let _ = text;
-        todo!("ADR 0003, wave 1: dev[client]")
+        let digits = matches!(text.len(), 40 | 64)
+            && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        digits.then(|| Self(text.to_owned()))
     }
 
     /// The full id, as GitHub sent it.
     pub fn as_str(&self) -> &str {
-        todo!("ADR 0003, wave 1: dev[client]")
+        &self.0
     }
 
     /// The first 7 characters, for display.
     pub fn short(&self) -> &str {
-        todo!("ADR 0003, wave 1: dev[client]")
+        // The invariant (ASCII hex digits, at least 40) makes the cut valid.
+        &self.0[..7]
     }
 }
 
@@ -452,13 +454,23 @@ impl MessageBody {
     /// Errors: [`Error::InvalidBody`] with [`BodyProblem::Blank`] when `text.trim()` is empty, with
     /// [`BodyProblem::TooLong`] (its character count) above [`MAX_BODY_CHARS`]. Never panics.
     pub fn new(text: &str) -> Result<Self, Error> {
-        let _ = text;
-        todo!("ADR 0003, wave 1: dev[client]")
+        if text.trim().is_empty() {
+            return Err(Error::InvalidBody {
+                problem: BodyProblem::Blank,
+            });
+        }
+        let chars = text.chars().count();
+        if chars > MAX_BODY_CHARS {
+            return Err(Error::InvalidBody {
+                problem: BodyProblem::TooLong { chars },
+            });
+        }
+        Ok(Self(text.to_owned()))
     }
 
     /// The text, as given to [`MessageBody::new`].
     pub fn as_str(&self) -> &str {
-        todo!("ADR 0003, wave 1: dev[client]")
+        &self.0
     }
 }
 
@@ -502,7 +514,10 @@ pub enum ReviewRequest {
 impl ReviewRequest {
     /// The Verdict this request carries.
     pub fn verdict(&self) -> Verdict {
-        todo!("ADR 0003, wave 1: dev[client]")
+        match self {
+            Self::Approve { .. } => Verdict::Approve,
+            Self::RequestChanges { .. } => Verdict::RequestChanges,
+        }
     }
 }
 

@@ -1,0 +1,13 @@
+[
+  {
+    "id": 80,
+    "user": { "login": "octocat", "id": 1, "type": "User", "site_admin": false },
+    "body": "Here is the body for the review.",
+    "state": "APPROVED",
+    "html_url": "https://github.com/octocat/Hello-World/pull/12#pullrequestreview-80",
+    "pull_request_url": "https://api.github.com/repos/octocat/Hello-World/pulls/12",
+    "submitted_at": "2019-11-17T17:43:43Z",
+    "commit_id": "ecdd80bb57125d7ba9641ffaa4d7d2c19d3f3091",
+    "author_association": "COLLABORATOR"
+  }
+]

@@ -600,7 +600,8 @@ async fn failed_publication(response: FailureResponse, message: &str) {
     app.type_text("my text");
     ctrl_s(&mut app);
     app.press(KeyCode::Char('y'));
-    app.wait_for("Cannot publish the comment").await;
+    // The 401 message has no "Cannot publish" prefix: wait for the start of the expected one.
+    app.wait_for(&message[..20]).await;
     app.settle().await;
     let screen = app.screen();
     assert!(flat(&screen).contains(message), "{message}\n{screen}");
@@ -653,17 +654,118 @@ async fn a_422_says_so_keeps_the_text_and_sends_nothing_again() {
 }
 
 #[tokio::test]
-async fn a_401_a_404_and_a_500_have_their_own_messages() {
+async fn a_401_and_a_404_have_their_own_messages() {
+    failed_publication(
+        FailureResponse::Unauthorized,
+        "GitHub rejected the token (401): it is invalid, expired or revoked.",
+    )
+    .await;
     failed_publication(
         FailureResponse::NotFound,
         "Cannot publish the comment: not found on GitHub (404)",
     )
     .await;
-    failed_publication(
-        FailureResponse::ServerError,
-        "Cannot publish the comment: GitHub answered with an error (HTTP 500).",
-    )
-    .await;
+}
+
+/// What the screen says when GitHub may have published the text anyway.
+const MAYBE: &str = "Cannot publish the comment: no clear answer from GitHub. It may have been published anyway: press Esc, then r to check the PR; the text comes back when you open the comment again.";
+
+#[tokio::test]
+async fn a_500_may_have_published_the_comment_and_says_so() {
+    // The fake has no 502 answer: every 5xx goes through the same rule (unit test `uncertain`).
+    failed_publication(FailureResponse::ServerError, MAYBE).await;
+}
+
+/// Compose with a 500 injected once on the POST, type "my text", publish: the message of a failure is shown.
+async fn failed_with_text() -> Harness {
+    let mut app = compose().await;
+    app.fake.with_state(|s| {
+        s.failures.push(Failure {
+            method: Method::Post,
+            path: "/repos/alice/notes/issues/1/comments".into(),
+            response: FailureResponse::ServerError,
+            remaining: Some(1),
+        });
+    });
+    app.type_text("my text");
+    ctrl_s(&mut app);
+    app.press(KeyCode::Char('y'));
+    app.wait_for("Cannot publish the comment").await;
+    app.settle().await;
+    app
+}
+
+#[tokio::test]
+async fn the_failure_message_stays_while_the_user_types() {
+    let mut app = failed_with_text().await;
+    app.type_text("!");
+    app.paste("?");
+    app.press(KeyCode::Left);
+    let screen = app.screen();
+    assert!(flat(&screen).contains(MAYBE), "{screen}");
+    assert!(screen.contains("my text!?"), "{screen}");
+}
+
+#[tokio::test]
+async fn esc_after_a_failure_keeps_the_text_for_the_next_comment_until_a_double_esc_throws_it() {
+    let mut app = failed_with_text().await;
+    app.press(KeyCode::Esc);
+    let screen = app.screen();
+    assert!(screen.contains("ghu · alice/notes · #1\n"), "{screen}");
+    assert!(
+        flat(&screen).contains("Text kept: open the comment again to get it back."),
+        "{screen}"
+    );
+    app.press(KeyCode::Char('r'));
+    app.wait_for("Description").await;
+    app.settle().await;
+    app.press(KeyCode::Char('c'));
+    let screen = app.screen();
+    assert!(screen.contains("· Comment"), "{screen}");
+    assert!(screen.contains("my text"), "{screen}");
+    assert!(
+        !flat(&screen).contains("Cannot publish"),
+        "no message: {screen}"
+    );
+    // Without the message, Esc is the double Esc again, and it throws the text away.
+    app.press(KeyCode::Esc);
+    assert_on_screen(&mut app, "Press Esc again to discard the text.");
+    app.press(KeyCode::Esc);
+    app.press(KeyCode::Char('c'));
+    let screen = app.screen();
+    assert!(
+        screen.contains("· Comment") && !screen.contains("my text"),
+        "{screen}"
+    );
+    assert_eq!(posts(&app).len(), 1);
+}
+
+#[tokio::test]
+async fn q_does_nothing_on_the_confirmation_and_while_publishing_and_the_help_key_opens_the_help() {
+    let mut app = compose().await;
+    app.type_text("keep");
+    ctrl_s(&mut app);
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    assert_on_screen(&mut app, "Publish this Comment on alice/notes #1?");
+    app.press_with(KeyCode::Char('?'), KeyModifiers::SHIFT);
+    assert_on_screen(&mut app, "Toggle this help");
+    app.press(KeyCode::Char('?'));
+    assert!(!app.screen().contains("Toggle this help"));
+    app.fake
+        .with_state(|s| s.latency = Duration::from_millis(400));
+    app.press(KeyCode::Char('y'));
+    assert_on_screen(&mut app, "Publishing…");
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    let screen = app.screen();
+    assert!(
+        screen.contains("Publishing: wait for GitHub's answer.") && screen.contains("Publishing…"),
+        "{screen}"
+    );
+    app.wait_for("Comment published.").await;
+    app.settle().await;
+    assert_eq!(only_posted_body(&app), "keep");
 }
 
 #[tokio::test]
@@ -671,13 +773,11 @@ async fn a_lost_network_says_it_may_have_been_published_and_never_resends() {
     let mut app = compose().await;
     app.type_text("maybe");
     ctrl_s(&mut app);
-    // Stop the server (its task and connections), then restart another one on the same port: it records what
-    // arrives after the cut.
+    // Stop the server (its task and connections): the next connection is refused.
     let port = app.fake.addr().port();
-    let (old, state) = {
-        let state = app.fake.with_state(|s| s.clone());
+    let old = {
         let placeholder = FakeGitHub::start(state_with(Vec::new())).await.unwrap();
-        (std::mem::replace(&mut app.fake, placeholder), state)
+        std::mem::replace(&mut app.fake, placeholder)
     };
     drop(old);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -685,26 +785,32 @@ async fn a_lost_network_says_it_may_have_been_published_and_never_resends() {
     app.wait_for("Cannot publish the comment").await;
     app.settle().await;
     let screen = app.screen();
-    assert!(
-        flat(&screen).contains(
-            "Cannot publish the comment: no answer from GitHub. It may have been published anyway: refresh the PR (Esc, r) before trying again."
-        ),
-        "{screen}"
-    );
+    assert!(flat(&screen).contains(MAYBE), "{screen}");
     assert!(
         screen.contains("maybe") && screen.contains(HINT),
         "{screen}"
     );
-    // Back online on the same port: nothing was sent by ghu on its own.
-    let again = FakeGitHub::start_on(port, state).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    app.settle().await;
-    assert!(
-        again.requests().iter().all(|r| r.method != Method::Post),
-        "{:?}",
-        again.requests()
-    );
-    drop(again);
+    // Nothing is sent by ghu on its own afterwards. A plain listener takes the port when it is still free (if
+    // another test took it meanwhile, there is nothing to watch and the check is skipped: no flaky failure);
+    // no connection may carry a POST.
+    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        listener.set_nonblocking(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        app.settle().await;
+        while let Ok((mut stream, _)) = listener.accept() {
+            use std::io::Read;
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut head = [0_u8; 8];
+            let read = stream.read(&mut head).unwrap_or(0);
+            assert!(
+                !head[..read].starts_with(b"POST"),
+                "ghu sent a second POST on its own"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------

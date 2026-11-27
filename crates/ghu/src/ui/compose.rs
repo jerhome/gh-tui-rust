@@ -19,7 +19,9 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use super::keys::{self, Binding};
 use super::text::clean;
 use super::text_area::{TextArea, TextKey, wrap};
-use super::{Flow, HelpRow, Notice, Outcome, RequestId, Shared, Signal, View, error_message};
+use super::{
+    Draft, Flow, HelpRow, Notice, Outcome, RequestId, Shared, Signal, View, error_message,
+};
 use crate::{EditorError, KeyCode, KeyEvent, KeyModifiers};
 
 /// The PR a text is published on.
@@ -110,9 +112,33 @@ const CONFIRM: [Binding<ConfirmAction>; 2] = [
 const WRITING_HINT: &str = " Ctrl-S publish… · Ctrl-E editor · Esc cancel";
 const CONFIRM_HINT: &str = " y / Enter publish · n / Esc back to the text";
 
-/// Shown when the network gave no answer (or the task died): the Comment may exist.
-const MAYBE_PUBLISHED: &str = "Cannot publish the comment: no answer from GitHub. It may have been published \
-                               anyway: refresh the PR (Esc, r) before trying again.";
+/// Whether GitHub may have created the text although the answer was not a clear success: no answer, an answer
+/// that cannot be used (usually a 2xx), or a 5xx (a gateway error, or a failure after the write).
+fn uncertain(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Network { .. }
+            | Error::UnexpectedResponse { .. }
+            | Error::Api {
+                status: 500..=599,
+                ..
+            }
+    )
+}
+
+/// Shown when the publication has no clear answer: the `what` (`comment` or `review`) may exist.
+fn maybe_published(what: &str) -> String {
+    format!(
+        "Cannot publish the {what}: no clear answer from GitHub. It may have been published anyway: press Esc, \
+         then r to check the PR; the text comes back when you open the {what} again."
+    )
+}
+
+/// The key of the global help (`?`, with or without Shift).
+fn is_help(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('?')
+        && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT)
+}
 
 /// The compose screen.
 pub(crate) struct ComposeScreen {
@@ -122,17 +148,23 @@ pub(crate) struct ComposeScreen {
     phase: Phase,
     /// The first `Esc` on a text was seen and no other key since.
     esc_armed: bool,
-    /// Why the last publication failed, drawn in red above the text until the next key.
+    /// Why the last publication failed, drawn in red above the text until the next publication.
     error: Option<String>,
 }
 
 impl ComposeScreen {
     /// Opened by `c`, `a` or `x` on the detail, only when `pr_detail::actions` allows it. No request at opening.
-    pub(crate) fn new(target: Target, kind: Kind) -> Self {
+    /// `draft`: the text kept for this `kind` (`Signal::Kept`), put in the field with the cursor at the end and
+    /// no message; `None`: an empty field.
+    pub(crate) fn new(target: Target, kind: Kind, draft: Option<String>) -> Self {
+        let mut text = TextArea::new();
+        if let Some(draft) = draft {
+            text.paste(&draft);
+        }
         Self {
             target,
             kind,
-            text: TextArea::new(),
+            text,
             phase: Phase::Writing,
             esc_armed: false,
             error: None,
@@ -141,12 +173,12 @@ impl ComposeScreen {
 
     fn key_writing(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
         let armed = std::mem::take(&mut self.esc_armed);
-        self.error = None;
         if self.text.key(key, shared) == TextKey::Handled {
             return Flow::Handled;
         }
         match keys::lookup(&WRITING, key) {
             Some(WritingAction::Publish) => self.check_text(shared),
+            Some(WritingAction::Cancel) if self.error.is_some() => self.close_keeping_text(shared),
             Some(WritingAction::Cancel) => {
                 if armed || self.text.text().trim().is_empty() {
                     shared.pop(None);
@@ -160,6 +192,26 @@ impl ComposeScreen {
             None => {}
         }
         Flow::Handled
+    }
+
+    /// `Esc` after a failed publication: the screen closes at once and the detail below keeps the text.
+    fn close_keeping_text(&mut self, shared: &mut Shared) {
+        let text = self.text.text();
+        if text.trim().is_empty() {
+            shared.pop(None);
+            return;
+        }
+        let what = match self.kind {
+            Kind::Comment => "comment",
+            Kind::Review(_) => "review",
+        };
+        shared.notify(Notice::Info(format!(
+            "Text kept: open the {what} again to get it back."
+        )));
+        shared.pop(Some(Signal::Kept(Draft {
+            kind: self.kind,
+            text,
+        })));
     }
 
     /// Ctrl-S: the text must be publishable, then the user is asked to confirm.
@@ -182,13 +234,15 @@ impl ComposeScreen {
         match keys::lookup(&CONFIRM, key) {
             Some(ConfirmAction::Publish) => self.publish(shared),
             Some(ConfirmAction::Back) => self.phase = Phase::Writing,
-            None => return Flow::Ignored,
+            None if is_help(key) => return Flow::Ignored,
+            None => {}
         }
         Flow::Handled
     }
 
     /// The only place that sends: one request, never repeated by itself.
     fn publish(&mut self, shared: &mut Shared) {
+        self.error = None;
         let text = self.text.text();
         let body = match MessageBody::new(&text) {
             Ok(body) => body,
@@ -211,11 +265,11 @@ impl ComposeScreen {
 
     fn key_publishing(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => shared.notify(Notice::Info(
+            (KeyCode::Esc | KeyCode::Char('q'), KeyModifiers::NONE) => shared.notify(Notice::Info(
                 "Publishing: wait for GitHub's answer.".to_owned(),
             )),
-            (KeyCode::Enter | KeyCode::Char('y' | 'n'), KeyModifiers::NONE) => {}
-            _ => return Flow::Ignored,
+            _ if is_help(key) => return Flow::Ignored,
+            _ => {}
         }
         Flow::Handled
     }
@@ -265,34 +319,36 @@ impl ComposeScreen {
         frame.render_widget(block, area);
         let [top, bottom] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+        let width = usize::from(top.width.saturating_sub(2)).max(1);
         let header = format!(
-            " Publish this Comment on {} {}?",
+            "Publish this Comment on {} {}?",
             self.target.repo, self.target.number
         );
-        let mut lines = vec![
-            Line::from(header).bold(),
-            Line::from(""),
-            Line::from(" Text:"),
-        ];
-        // Text rows after the three lines above; the last one says how many are left when the text is cut.
-        let room = usize::from(top.height).saturating_sub(lines.len());
-        let width = usize::from(top.width.saturating_sub(2)).max(1);
+        // The header may be long (owner/name): it is wrapped like the text.
+        let mut lines: Vec<Line<'_>> = wrap(&clean(&header), width)
+            .into_iter()
+            .map(|row| Line::from(format!(" {row}")).bold())
+            .collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(" Text:"));
         let text = self.text.text();
         let rows: Vec<String> = text
             .split('\n')
             .flat_map(|line| wrap(&clean(line), width))
             .collect();
-        let shown = if rows.len() <= room {
-            rows.len()
+        let height = usize::from(top.height);
+        let room = height.saturating_sub(lines.len());
+        if rows.len() <= room {
+            lines.extend(rows.iter().map(|row| Line::from(format!(" {row}"))));
         } else {
-            room.saturating_sub(1)
-        };
-        lines.extend(
-            rows[..shown]
-                .iter()
-                .map(|row| Line::from(format!(" {row}"))),
-        );
-        if shown < rows.len() && room > 0 {
+            // The last row of the area always says how many lines are left: the fixed lines give way if need be.
+            let shown = room.saturating_sub(1);
+            lines.truncate(height.saturating_sub(1 + shown));
+            lines.extend(
+                rows[..shown]
+                    .iter()
+                    .map(|row| Line::from(format!(" {row}"))),
+            );
             lines.push(Line::from(format!(" … {} more lines", rows.len() - shown)).dim());
         }
         frame.render_widget(Paragraph::new(lines), top);
@@ -341,6 +397,7 @@ impl View for ComposeScreen {
 
     fn paste(&mut self, text: &str, _shared: &mut Shared) {
         if self.editing() {
+            self.esc_armed = false;
             self.text.paste(text);
         }
     }
@@ -354,9 +411,13 @@ impl View for ComposeScreen {
                 shared.notify(Notice::Info("Comment published.".to_owned()));
                 shared.pop(Some(Signal::Published));
             }
-            Outcome::CommentPosted(Err(Error::Network { .. })) | Outcome::TaskFailed => {
-                tracing::warn!("no answer to the comment publication");
-                self.failed(MAYBE_PUBLISHED.to_owned());
+            Outcome::CommentPosted(Err(error)) if uncertain(&error) => {
+                tracing::warn!(%error, "no clear answer to the comment publication");
+                self.failed(maybe_published("comment"));
+            }
+            Outcome::TaskFailed => {
+                tracing::warn!("the comment publication task died");
+                self.failed(maybe_published("comment"));
             }
             Outcome::CommentPosted(Err(error)) => {
                 tracing::warn!(%error, "publishing the comment failed");
@@ -393,6 +454,7 @@ impl View for ComposeScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Draft;
     use crate::ui::text_area::test_shared;
 
     fn screen(kind: Kind) -> ComposeScreen {
@@ -403,6 +465,7 @@ mod tests {
                 head: CommitSha::parse(&"a".repeat(40)).expect("sha"),
             },
             kind,
+            None,
         )
     }
 
@@ -429,7 +492,7 @@ mod tests {
         assert!(
             message.starts_with("Cannot publish the comment: ")
                 && message.contains("may have been published")
-                && message.contains("refresh the PR (Esc, r) before trying again"),
+                && message.contains("press Esc, then r to check the PR"),
             "{message}"
         );
         assert!(shared.popped.is_none(), "the screen stays open");
@@ -472,6 +535,305 @@ mod tests {
             }
         }
         assert!(screen(Kind::Review(Verdict::Approve)).help().is_empty());
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A Comment screen showing the message of a failed publication, with `text` in the field.
+    fn failed_screen(kind: Kind, text: &str) -> ComposeScreen {
+        let mut compose = screen(kind);
+        compose.text.paste(text);
+        compose.error = Some("Cannot publish: failed".to_owned());
+        compose
+    }
+
+    fn api(status: u16) -> Error {
+        Error::Api {
+            status,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn uncertain_is_true_for_no_answer_unreadable_answer_and_5xx_only() {
+        let yes = [
+            Error::Network {
+                message: "reset".to_owned(),
+            },
+            Error::UnexpectedResponse {
+                message: "bad json".to_owned(),
+            },
+            api(500),
+            api(502),
+            api(599),
+        ];
+        for error in &yes {
+            assert!(uncertain(error), "{error:?}");
+        }
+        let no = [
+            api(499),
+            api(600),
+            Error::Forbidden {
+                message: String::new(),
+            },
+            Error::NotFound,
+            Error::Unprocessable {
+                message: String::new(),
+            },
+            Error::RateLimited { reset_at: None },
+            Error::Unauthorized,
+        ];
+        for error in &no {
+            assert!(!uncertain(error), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_error_gives_the_may_have_been_published_message() {
+        for error in [
+            Error::Network {
+                message: "reset".to_owned(),
+            },
+            api(502),
+        ] {
+            let mut shared = test_shared();
+            let (mut compose, id) = publishing(&mut shared).await;
+            assert!(
+                compose
+                    .apply(id, Outcome::CommentPosted(Err(error)), &mut shared)
+                    .is_none()
+            );
+            assert_eq!(
+                compose.error.as_deref(),
+                Some(maybe_published("comment").as_str())
+            );
+        }
+        // A certain failure keeps its own message.
+        let mut shared = test_shared();
+        let (mut compose, id) = publishing(&mut shared).await;
+        compose.apply(id, Outcome::CommentPosted(Err(api(404))), &mut shared);
+        assert!(
+            compose
+                .error
+                .as_deref()
+                .is_some_and(|m| m.contains("HTTP 404")),
+            "{:?}",
+            compose.error
+        );
+    }
+
+    #[test]
+    fn the_uncertain_message_is_exact_for_a_comment_and_a_review() {
+        assert_eq!(
+            maybe_published("comment"),
+            "Cannot publish the comment: no clear answer from GitHub. It may have been published anyway: press Esc, then r to check the PR; the text comes back when you open the comment again."
+        );
+        assert!(maybe_published("review").ends_with("open the review again."));
+    }
+
+    #[test]
+    fn esc_after_a_failure_keeps_the_text_in_one_press() {
+        for (kind, word) in [
+            (Kind::Comment, "comment"),
+            (Kind::Review(Verdict::RequestChanges), "review"),
+        ] {
+            let mut shared = test_shared();
+            let mut compose = failed_screen(kind, "my text\nline 2");
+            compose.key_writing(key(KeyCode::Esc), &mut shared);
+            assert_eq!(
+                shared.popped,
+                Some(Some(Signal::Kept(Draft {
+                    kind,
+                    text: "my text\nline 2".to_owned(),
+                })))
+            );
+            assert!(
+                matches!(&shared.notice, Some(Notice::Info(m)) if m == &format!("Text kept: open the {word} again to get it back.")),
+                "{:?}",
+                shared.notice
+            );
+        }
+    }
+
+    #[test]
+    fn esc_after_a_failure_on_a_blank_text_closes_without_a_draft() {
+        let mut shared = test_shared();
+        let mut compose = failed_screen(Kind::Comment, "  \n ");
+        compose.key_writing(key(KeyCode::Esc), &mut shared);
+        assert_eq!(shared.popped, Some(None));
+    }
+
+    #[tokio::test]
+    async fn the_failure_message_stays_while_typing_pasting_and_refusing_and_goes_at_the_next_publication()
+     {
+        let mut shared = test_shared();
+        let mut compose = failed_screen(Kind::Comment, "x");
+        compose.key_writing(key(KeyCode::Char('y')), &mut shared);
+        compose.paste("more", &mut shared);
+        compose.key_writing(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut shared,
+        );
+        assert_eq!(compose.phase, Phase::Confirm);
+        assert!(compose.error.is_some());
+        compose.key_confirm(key(KeyCode::Char('y')), &mut shared);
+        assert!(matches!(compose.phase, Phase::Publishing(_)));
+        assert!(compose.error.is_none());
+    }
+
+    #[test]
+    fn a_draft_fills_the_field_with_the_cursor_at_the_end_and_no_message() {
+        let mut shared = test_shared();
+        let mut compose = ComposeScreen::new(
+            screen(Kind::Comment).target,
+            Kind::Comment,
+            Some("kept\ntext".to_owned()),
+        );
+        assert_eq!(compose.text.text(), "kept\ntext");
+        assert!(compose.error.is_none() && !compose.esc_armed);
+        compose.key_writing(key(KeyCode::Char('!')), &mut shared);
+        assert_eq!(compose.text.text(), "kept\ntext!");
+        // Without the failure message, Esc is the double Esc again.
+        compose.key_writing(key(KeyCode::Esc), &mut shared);
+        assert!(shared.popped.is_none() && compose.esc_armed);
+    }
+
+    #[test]
+    fn a_paste_disarms_the_double_esc() {
+        let mut shared = test_shared();
+        let mut compose = screen(Kind::Comment);
+        compose.key_writing(key(KeyCode::Char('a')), &mut shared);
+        compose.key_writing(key(KeyCode::Esc), &mut shared);
+        assert!(compose.esc_armed);
+        compose.paste("b", &mut shared);
+        assert!(!compose.esc_armed);
+        compose.key_writing(key(KeyCode::Esc), &mut shared);
+        assert!(shared.popped.is_none(), "the second Esc only arms again");
+    }
+
+    #[test]
+    fn the_confirmation_takes_every_key_but_the_help_key() {
+        let mut shared = test_shared();
+        let mut compose = screen(Kind::Comment);
+        compose.text.paste("t");
+        compose.phase = Phase::Confirm;
+        for code in [KeyCode::Char('q'), KeyCode::Char('x'), KeyCode::Left] {
+            assert!(matches!(
+                compose.key_confirm(key(code), &mut shared),
+                Flow::Handled
+            ));
+        }
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert!(matches!(
+                compose.key_confirm(KeyEvent::new(KeyCode::Char('?'), modifiers), &mut shared),
+                Flow::Ignored
+            ));
+        }
+        assert_eq!(compose.phase, Phase::Confirm);
+    }
+
+    #[tokio::test]
+    async fn publishing_takes_every_key_but_the_help_key_and_esc_and_q_say_to_wait() {
+        let mut shared = test_shared();
+        let (mut compose, id) = publishing(&mut shared).await;
+        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Left] {
+            assert!(matches!(
+                compose.key_publishing(key(code), &mut shared),
+                Flow::Handled
+            ));
+            assert!(shared.notice.is_none());
+        }
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            shared.notice = None;
+            assert!(matches!(
+                compose.key_publishing(key(code), &mut shared),
+                Flow::Handled
+            ));
+            assert!(
+                matches!(&shared.notice, Some(Notice::Info(m)) if m == "Publishing: wait for GitHub's answer."),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            compose.key_publishing(key(KeyCode::Char('?')), &mut shared),
+            Flow::Ignored
+        ));
+        assert_eq!(compose.phase, Phase::Publishing(id));
+        assert!(shared.popped.is_none());
+    }
+
+    /// What `render_confirm` draws on a `width` × `height` terminal, one row per line.
+    fn confirm_drawn(compose: &ComposeScreen, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| compose.render_confirm(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                (area.left()..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_confirmation_header_is_wrapped_not_cut() {
+        let name = "n".repeat(60);
+        let mut compose = ComposeScreen::new(
+            Target {
+                repo: format!("alice/{name}").parse().expect("repo name"),
+                number: PrNumber::new(12).expect("number"),
+                head: CommitSha::parse(&"a".repeat(40)).expect("sha"),
+            },
+            Kind::Comment,
+            Some("body".to_owned()),
+        );
+        compose.phase = Phase::Confirm;
+        let screen = confirm_drawn(&compose, 40, 14);
+        let squashed: String = screen
+            .chars()
+            .filter(|c| !matches!(c, ' ' | '│' | '\n'))
+            .collect();
+        assert!(
+            squashed.contains(&format!("PublishthisCommentonalice/{name}#12?")),
+            "{screen}"
+        );
+        assert!(screen.contains("body"), "{screen}");
+    }
+
+    #[test]
+    fn a_cut_text_always_says_how_many_lines_are_left() {
+        let text = (1..=10)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut compose = screen(Kind::Comment);
+        compose.text.paste(&text);
+        compose.phase = Phase::Confirm;
+        // Heights 5 and 7 leave 1 and 3 rows above the 2-row footer: no room for the text at all.
+        for height in [5, 6, 7, 8] {
+            let screen = confirm_drawn(&compose, 60, height);
+            let shown = screen.lines().filter(|l| l.contains("row ")).count();
+            let more = screen
+                .lines()
+                .find_map(|l| {
+                    l.trim_matches(|c| c == '│' || c == ' ')
+                        .strip_prefix("… ")?
+                        .strip_suffix(" more lines")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .unwrap_or_else(|| panic!("height {height}: no '… k more lines':\n{screen}"));
+            assert_eq!(shown + more, 10, "height {height}\n{screen}");
+        }
     }
 
     #[test]

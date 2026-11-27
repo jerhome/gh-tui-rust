@@ -202,10 +202,6 @@ impl PrDetailScreen {
 
     /// The kept text for `kind` (`Signal::Kept`), moved out; `None` when the draft is of another kind (kept
     /// then) or there is none.
-    #[allow(
-        dead_code,
-        reason = "ADR 0003 § 4: called by open_compose once ComposeScreen::new takes the draft (dev[tui-compose])"
-    )]
     fn take_draft(&mut self, kind: Kind) -> Option<String> {
         if self.draft.as_ref()?.kind != kind {
             return None;
@@ -214,7 +210,7 @@ impl PrDetailScreen {
     }
 
     /// The compose screen for `kind`, if the loaded PR allows it; nothing otherwise.
-    fn open_compose(&self, kind: Kind) -> Flow {
+    fn open_compose(&mut self, kind: Kind) -> Flow {
         let Load::Loaded(page) = &self.load else {
             return Flow::Handled;
         };
@@ -230,7 +226,8 @@ impl PrDetailScreen {
             number: self.number,
             head: page.pull.head_sha.clone(),
         };
-        Flow::Push(Box::new(ComposeScreen::new(target, kind)))
+        let draft = self.take_draft(kind);
+        Flow::Push(Box::new(ComposeScreen::new(target, kind, draft)))
     }
 }
 

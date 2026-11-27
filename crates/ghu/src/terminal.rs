@@ -10,6 +10,7 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
 };
@@ -17,7 +18,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use tokio::sync::mpsc;
 
-use crate::{Context, Input, Ui};
+use crate::{Context, EditRequest, EditorError, Input, Ui};
 
 /// How long the keyboard thread waits for an event before sending a tick (and checking whether to stop).
 const POLL: Duration = Duration::from_millis(200);
@@ -57,11 +58,16 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
+/// Enters the TUI mode: raw mode, alternate screen, bracketed paste. The caller restores on failure.
+fn enter_tui_mode() -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
+}
+
 /// Enters the TUI mode and builds the terminal. Undoes what it did on failure.
 fn init_terminal() -> io::Result<DefaultTerminal> {
     let result = (|| {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        enter_tui_mode()?;
         Terminal::new(CrosstermBackend::new(io::stdout()))
     })();
     if result.is_err() {
@@ -104,16 +110,66 @@ pub async fn run(ctx: Context) -> io::Result<()> {
 
 type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static;
 
+/// The keyboard thread and its stop flag.
+struct Keyboard {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Keyboard {
+    /// Starts a keyboard thread sending to `tx`.
+    fn start(tx: &mpsc::UnboundedSender<Message>) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name("ghu-keyboard".into())
+                .spawn(move || read_keyboard(&tx, &stop))?
+        };
+        Ok(Self { stop, thread })
+    }
+
+    /// Stops the thread and waits for it: within one poll period (200 ms). Afterwards nothing reads the terminal.
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // A panic there was already reported by the panic hook (which restored the terminal).
+        let _ = self.thread.join();
+    }
+}
+
+/// Runs the editor with the terminal handed over (ADR 0003 § 5): keyboard thread stopped and joined, TUI mode left,
+/// `EditRequest::run` on a blocking thread, TUI mode entered again, new keyboard thread, full repaint, result given
+/// to the screen. On an error, the TUI mode may be half entered: the caller ends `run`, which restores the
+/// terminal; the keyboard thread is then already stopped.
+async fn edit<B: ratatui::backend::Backend<Error = io::Error>>(
+    ui: &mut Ui<B>,
+    request: EditRequest,
+    keyboard: Keyboard,
+    tx: &mpsc::UnboundedSender<Message>,
+) -> io::Result<Keyboard> {
+    keyboard.stop();
+    restore_terminal();
+    // Best effort: an editor that draws its own cursor does not need it.
+    let _ = execute!(io::stdout(), Show);
+    let result = tokio::task::spawn_blocking(move || request.run())
+        .await
+        .unwrap_or_else(|error| {
+            Err(EditorError::Io {
+                message: error.to_string(),
+            })
+        });
+    enter_tui_mode()?;
+    let keyboard = Keyboard::start(tx)?;
+    ui.clear()?;
+    ui.finish_edit(result);
+    Ok(keyboard)
+}
+
 /// The event loop, between terminal set-up and restoration.
 async fn drive<B: ratatui::backend::Backend<Error = io::Error>>(mut ui: Ui<B>) -> io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let keyboard = {
-        let stop = Arc::clone(&stop);
-        std::thread::Builder::new()
-            .name("ghu-keyboard".into())
-            .spawn(move || read_keyboard(&tx, &stop))?
-    };
+    let mut keyboard = Some(Keyboard::start(&tx)?);
 
     let result = loop {
         if let Err(error) = ui.draw() {
@@ -124,7 +180,16 @@ async fn drive<B: ratatui::backend::Backend<Error = io::Error>>(mut ui: Ui<B>) -
         }
         tokio::select! {
             message = rx.recv() => match message {
-                Some(Message::Input(input)) => ui.input(input),
+                Some(Message::Input(input)) => {
+                    ui.input(input);
+                    if let Some(request) = ui.take_edit() {
+                        let current = keyboard.take().expect("the keyboard thread runs between edits");
+                        match edit(&mut ui, request, current, &tx).await {
+                            Ok(next) => keyboard = Some(next),
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
                 Some(Message::Tick) => ui.tick(),
                 Some(Message::Failed(error)) => break Err(error),
                 None => break Err(io::Error::other("the keyboard thread stopped")),
@@ -133,10 +198,10 @@ async fn drive<B: ratatui::backend::Backend<Error = io::Error>>(mut ui: Ui<B>) -
         }
     };
 
-    stop.store(true, Ordering::Relaxed);
     drop(rx);
-    // Ends within one poll period; a panic there was already reported by the panic hook.
-    let _ = keyboard.join();
+    if let Some(keyboard) = keyboard {
+        keyboard.stop();
+    }
     result
 }
 

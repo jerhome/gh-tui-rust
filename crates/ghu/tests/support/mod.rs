@@ -23,6 +23,9 @@ pub const SIZE: (u16, u16) = (100, 30);
 /// Longest wait of [`Harness::wait_for`] before failing.
 pub const WAIT: Duration = Duration::from_secs(5);
 
+/// `EDITOR` of every [`TestEnv::for_fake`]: a program that does not exist.
+pub const NO_EDITOR: &str = "/nonexistent/ghu-editor";
+
 /// A map-backed [`Environment`].
 #[derive(Clone, Debug, Default)]
 pub struct TestEnv {
@@ -38,12 +41,14 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
-    /// `GHU_API_URL` = the fake's URL and `GH_TOKEN` = the fake's accepted token.
+    /// `GHU_API_URL` = the fake's URL, `GH_TOKEN` = the fake's accepted token, `EDITOR` = [`NO_EDITOR`] (a test
+    /// that presses `Ctrl-E` without choosing an editor never starts the real `vi` or `notepad`).
     pub fn for_fake(fake: &FakeGitHub) -> Self {
         let token = fake.with_state(|s| s.token.clone());
         let mut env = Self::default();
         env.set(ghu::API_URL_VAR, &fake.base_url());
         env.set("GH_TOKEN", &token);
+        env.set("EDITOR", NO_EDITOR);
         env
     }
 
@@ -145,6 +150,8 @@ pub struct Harness {
     env: TestEnv,
     /// Deleted when the harness is dropped.
     config: tempfile::TempDir,
+    /// `ReturnedAtOnce` threshold given to each editor request (`EditRequest::with_returned_at_once`).
+    edit_threshold: Duration,
 }
 
 impl Harness {
@@ -171,6 +178,7 @@ impl Harness {
             ui,
             env,
             config,
+            edit_threshold: ghu::RETURNED_AT_ONCE,
         }
     }
 
@@ -200,9 +208,20 @@ impl Harness {
         self.press_with(code, KeyModifiers::NONE);
     }
 
-    /// Sends a key press with modifiers (`Ctrl-C`…).
+    /// Sends a key press with modifiers (`Ctrl-C`…). If the key asked for the editor (`Ctrl-E`), runs it at once
+    /// (blocking, no terminal to suspend) and gives its result back, as the real loop does.
     pub fn press_with(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         self.ui.input(Input::Key(KeyEvent::new(code, modifiers)));
+        if let Some(request) = self.ui.take_edit() {
+            let result = request.with_returned_at_once(self.edit_threshold).run();
+            self.ui.finish_edit(result);
+        }
+    }
+
+    /// Sets the `ReturnedAtOnce` threshold of the next editor runs (default `ghu::RETURNED_AT_ONCE`;
+    /// `Duration::ZERO` disables the check).
+    pub fn set_edit_threshold(&mut self, threshold: Duration) {
+        self.edit_threshold = threshold;
     }
 
     /// Sends each character of `text` as a key press.

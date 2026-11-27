@@ -10,8 +10,8 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::Shared;
 use super::text::clean;
+use super::{Notice, Shared};
 use crate::{EditorError, KeyCode, KeyEvent, KeyModifiers};
 
 /// A multi-line text field. The text holds no control character but `\n` and `\t` (others dropped on insert,
@@ -54,15 +54,14 @@ impl TextArea {
     }
 
     /// Characters (with or without Shift, and AltGr = Ctrl+Alt on Windows), Enter (newline), Backspace, Delete,
-    /// arrows, Home, End; `Ctrl-E` (#9): [`Shared::request_edit`] with the current text (until wave 4: ignored,
-    /// returns [`TextKey::Handled`] without effect).
+    /// arrows, Home, End; `Ctrl-E` (#9): [`Shared::request_edit`] with the current text.
     pub(crate) fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> TextKey {
-        // Wave 4 (dev[tui-editor]) uses `shared` for Ctrl-E.
-        let _ = shared;
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         let altgr = key.modifiers == KeyModifiers::CONTROL | KeyModifiers::ALT;
         match key.code {
-            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {}
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+                shared.request_edit(self.text());
+            }
             KeyCode::Char(c) if plain || altgr => self.insert_char(c),
             KeyCode::Enter if plain => self.insert_newline(),
             KeyCode::Backspace if plain => self.backspace(),
@@ -95,8 +94,19 @@ impl TextArea {
     /// filtering as a paste), cursor at the end. `Err`: text unchanged, `Notice::Error` with the message of
     /// ADR 0003 § 5.
     pub(crate) fn edited(&mut self, result: Result<String, EditorError>, shared: &mut Shared) {
-        let _ = (result, shared);
-        todo!("ADR 0003, wave 4: dev[tui-editor]")
+        match result {
+            Ok(text) => {
+                let text = normalise(text.strip_prefix('\u{feff}').unwrap_or(&text));
+                self.lines = text
+                    .trim_end_matches('\n')
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect();
+                let last = self.lines.len() - 1;
+                self.cursor = (last, self.line_len(last));
+            }
+            Err(error) => shared.notify(Notice::Error(editor_message(&error))),
+        }
     }
 
     /// Draws the field in `area` and places the terminal cursor.
@@ -239,6 +249,35 @@ impl TextArea {
             line - 1
         };
         self.cursor = (target, column.min(self.line_len(target)));
+    }
+}
+
+/// The notice for an editor failure (ADR 0003 § 5).
+fn editor_message(error: &EditorError) -> String {
+    match error {
+        EditorError::Unparsable { var } => {
+            format!("Cannot read {var}: unbalanced quote or no program.")
+        }
+        EditorError::NotFound { program } => format!(
+            "Cannot open the editor: {} was not found. Set VISUAL or EDITOR.",
+            clean(program)
+        ),
+        EditorError::Failed { code: Some(code) } => {
+            format!("The editor failed (exit code {code}): the text is unchanged.")
+        }
+        EditorError::Failed { code: None } => {
+            "The editor failed (stopped): the text is unchanged.".to_owned()
+        }
+        EditorError::TooLarge => {
+            "The edited text is larger than 1 MiB: the text is unchanged.".to_owned()
+        }
+        EditorError::NotUtf8 => "The edited text is not UTF-8: the text is unchanged.".to_owned(),
+        EditorError::ReturnedAtOnce => {
+            "The editor returned at once: the text is unchanged. Set VISUAL to an \
+             editor that waits (vim, nano, \"code.cmd --wait\")."
+                .to_owned()
+        }
+        EditorError::Io { message } => format!("Cannot use the editor: {}.", clean(message)),
     }
 }
 
@@ -432,7 +471,7 @@ mod tests {
             );
         }
         assert_eq!(area.text(), "abc");
-        // Ctrl-E is the editor's (wave 4): used, without effect for now.
+        // Ctrl-E is the editor's (#9): used, text unchanged, editor asked for.
         assert_eq!(
             area.key(
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
@@ -441,7 +480,7 @@ mod tests {
             TextKey::Handled
         );
         assert_eq!(area.text(), "abc");
-        assert!(shared.edit.is_none());
+        assert_eq!(shared.edit.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -623,6 +662,98 @@ mod tests {
                     cursor.0 < width && cursor.1 < height,
                     "step {step}: {cursor:?}"
                 );
+            }
+        }
+    }
+
+    fn ctrl_e(area: &mut TextArea, shared: &mut Shared) -> TextKey {
+        area.key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            shared,
+        )
+    }
+
+    #[test]
+    fn ctrl_e_asks_for_the_editor_with_the_current_text() {
+        let mut shared = test_shared();
+        let mut area = TextArea::new();
+        type_text(&mut area, &mut shared, "ab");
+        press(&mut area, &mut shared, KeyCode::Enter);
+        type_text(&mut area, &mut shared, "c");
+        assert_eq!(ctrl_e(&mut area, &mut shared), TextKey::Handled);
+        assert_eq!(shared.edit.as_deref(), Some("ab\nc"));
+        assert_eq!(area.text(), "ab\nc");
+    }
+
+    #[test]
+    fn an_edited_text_replaces_the_field_cleaned_with_the_cursor_at_the_end() {
+        let mut shared = test_shared();
+        let mut area = TextArea::new();
+        type_text(&mut area, &mut shared, "old");
+        area.edited(
+            Ok("\u{feff}one\r\ntwo\u{1b}\rthree\n\n".to_owned()),
+            &mut shared,
+        );
+        assert_eq!(area.text(), "one\ntwo\nthree");
+        assert_eq!(area.cursor, (2, 5));
+        assert!(shared.notice.is_none());
+        area.edited(Ok(String::new()), &mut shared);
+        assert_eq!(area.text(), "");
+        assert_eq!(area.cursor, (0, 0));
+        area.edited(Ok("\n\n".to_owned()), &mut shared);
+        assert_eq!(area.lines, vec![String::new()]);
+    }
+
+    #[test]
+    fn an_editor_failure_keeps_the_text_and_says_why() {
+        let cases = [
+            (
+                EditorError::Unparsable { var: "VISUAL" },
+                "Cannot read VISUAL: unbalanced quote or no program.",
+            ),
+            (
+                EditorError::NotFound {
+                    program: "nvim".to_owned(),
+                },
+                "Cannot open the editor: nvim was not found. Set VISUAL or EDITOR.",
+            ),
+            (
+                EditorError::Failed { code: Some(3) },
+                "The editor failed (exit code 3): the text is unchanged.",
+            ),
+            (
+                EditorError::Failed { code: None },
+                "The editor failed (stopped): the text is unchanged.",
+            ),
+            (
+                EditorError::TooLarge,
+                "The edited text is larger than 1 MiB: the text is unchanged.",
+            ),
+            (
+                EditorError::NotUtf8,
+                "The edited text is not UTF-8: the text is unchanged.",
+            ),
+            (
+                EditorError::ReturnedAtOnce,
+                "The editor returned at once: the text is unchanged. Set VISUAL to an editor that waits (vim, \
+                 nano, \"code.cmd --wait\").",
+            ),
+            (
+                EditorError::Io {
+                    message: "disk full".to_owned(),
+                },
+                "Cannot use the editor: disk full.",
+            ),
+        ];
+        for (error, message) in cases {
+            let mut shared = test_shared();
+            let mut area = TextArea::new();
+            type_text(&mut area, &mut shared, "kept");
+            area.edited(Err(error), &mut shared);
+            assert_eq!(area.text(), "kept");
+            match &shared.notice {
+                Some(Notice::Error(text)) => assert_eq!(text, message),
+                other => panic!("{message}: {:?}", other.as_ref().map(|_| "not an error")),
             }
         }
     }

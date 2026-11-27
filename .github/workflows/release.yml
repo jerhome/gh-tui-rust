@@ -1,10 +1,12 @@
 name: Release
 
 # Tag v*: build, archive, checksum and publish the GitHub release.
-# workflow_dispatch: same build, artifacts only; a release is created only when run on a v* tag with publish=true.
+# Push to a wip-*-release branch, or workflow_dispatch: same build, artifacts only; a release is created only when run on a v* tag with publish=true.
 on:
   push:
     tags: ["v*"]
+    # Dry run of the release build on a branch (artifacts only, never published).
+    branches: ["wip-*-release"]
   workflow_dispatch:
     inputs:
       publish:

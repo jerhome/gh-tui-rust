@@ -461,6 +461,68 @@ async fn a_draft_comes_back_for_the_same_verdict_only() {
     assert_eq!(posts(&app).len(), 2);
 }
 
+/// After a 422: Esc keeps the text, `r` reloads the PR, the same Verdict gets the text back, the other starts empty.
+#[tokio::test]
+async fn after_a_422_esc_and_a_refresh_the_same_verdict_gets_its_text_back_and_the_other_starts_empty()
+ {
+    for (key, other, title, other_title) in [
+        ('x', 'a', "Review: Request changes", "Review: Approve"),
+        ('a', 'x', "Review: Approve", "Review: Request changes"),
+    ] {
+        let mut app = review(key).await;
+        fail_once(
+            &app,
+            FailureResponse::Unprocessable {
+                message: "Unprocessable".into(),
+            },
+        );
+        app.type_text("kept words");
+        ctrl_s(&mut app);
+        app.press(KeyCode::Char('y'));
+        app.wait_for("GitHub refused the review (422).").await;
+        app.settle().await;
+        app.press(KeyCode::Esc);
+        app.wait_for("Text kept: open the review again to get it back.")
+            .await;
+        app.settle().await;
+        let gets = |app: &Harness| {
+            app.fake
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == Method::Get)
+                .count()
+        };
+        let before = gets(&app);
+        app.press(KeyCode::Char('r'));
+        for _ in 0..100 {
+            if gets(&app) > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gets(&app) > before, "the refresh reloaded the PR");
+        app.settle().await;
+        assert_on_screen(&mut app, "Description");
+        app.press(KeyCode::Char(key));
+        let screen = app.screen();
+        assert!(
+            screen.contains(title)
+                && screen.contains("kept words")
+                && !screen.contains("GitHub refused"),
+            "{screen}"
+        );
+        app.press(KeyCode::Esc);
+        app.press(KeyCode::Esc);
+        app.settle().await;
+        app.press(KeyCode::Char(other));
+        let screen = app.screen();
+        assert!(
+            screen.contains(other_title) && !screen.contains("kept words"),
+            "{screen}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn q_does_nothing_on_the_confirmation_and_while_publishing() {
     let mut app = review('x').await;

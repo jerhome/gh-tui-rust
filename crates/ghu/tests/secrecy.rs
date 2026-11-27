@@ -128,6 +128,27 @@ async fn the_token_never_shows_when_a_review_is_published() {
     assert_eq!(post.token.as_deref(), Some(SECRET));
     assert_hidden("the screen", &app.screen());
     assert_hidden("the logs", &logs.text());
+    // ADR 0003 § 7: the published text is never logged.
+    assert!(
+        !logs.text().contains("needs work"),
+        "the text is in the logs"
+    );
+}
+
+#[tokio::test]
+async fn the_text_of_an_approve_is_not_logged_either() {
+    let logs = LogCapture::start();
+    let mut app = review_screen(review_state(), 'a').await;
+    app.type_text("looks fine to me");
+    app.press_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    app.press(KeyCode::Char('y'));
+    app.wait_for("Review published: Approve.").await;
+    app.settle().await;
+    assert_hidden("the logs", &logs.text());
+    assert!(
+        !logs.text().contains("looks fine to me"),
+        "the text is in the logs"
+    );
 }
 
 #[tokio::test]

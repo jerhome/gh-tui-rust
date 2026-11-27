@@ -28,10 +28,20 @@ fn state() -> State {
 
 /// The compose screen of a Comment on PR #1 of `alice/notes`, with `VISUAL` unset and `EDITOR` = `editor`.
 async fn compose(editor: &str) -> Harness {
-    let editor = editor.to_owned();
+    compose_with(None, Some(editor.to_owned())).await
+}
+
+/// The compose screen of a Comment with the given `VISUAL` and `EDITOR` (`None` = unset).
+async fn compose_with(visual: Option<String>, editor: Option<String>) -> Harness {
     let mut app = Harness::start_with(state(), move |env, _| {
         env.unset("VISUAL");
-        env.set("EDITOR", &editor);
+        env.unset("EDITOR");
+        if let Some(v) = &visual {
+            env.set("VISUAL", v);
+        }
+        if let Some(e) = &editor {
+            env.set("EDITOR", e);
+        }
     })
     .await;
     app.wait_for("alice/notes").await;
@@ -122,26 +132,40 @@ async fn an_editor_that_is_not_found_is_named() {
 
 #[tokio::test]
 async fn visual_is_used_before_editor() {
-    let upper = fake("upper");
-    let mut app = Harness::start_with(state(), move |env, _| {
-        env.set("VISUAL", "/nonexistent/ghu-visual");
-        env.set("EDITOR", &upper);
-    })
-    .await;
-    app.wait_for("alice/notes").await;
-    app.press(KeyCode::Enter);
-    app.wait_for("Pull requests (open)").await;
-    app.settle().await;
-    app.press(KeyCode::Enter);
-    app.wait_for("Description").await;
-    app.settle().await;
-    app.press(KeyCode::Char('c'));
+    let mut app = compose_with(Some("/nonexistent/ghu-visual".into()), Some(fake("upper"))).await;
     app.type_text("kept");
     ctrl(&mut app, 'e');
     assert_refused(
         &mut app,
         "Cannot open the editor: /nonexistent/ghu-visual was not found.",
     );
+}
+
+/// A Comment composer with the given `VISUAL` and `EDITOR`, after typing "kept" and Ctrl-E.
+async fn edit_with(visual: Option<String>, editor: Option<String>) -> Harness {
+    let mut app = compose_with(visual, editor).await;
+    app.type_text("kept");
+    ctrl(&mut app, 'e');
+    app
+}
+
+#[tokio::test]
+async fn visual_runs_and_editor_is_not_tried_when_both_work() {
+    let mut app = edit_with(
+        Some(fake(r#"write "from visual""#)),
+        Some(fake(r#"write "from editor""#)),
+    )
+    .await;
+    let screen = app.screen();
+    assert!(screen.contains("from visual"), "{screen}");
+    assert!(!screen.contains("from editor"), "{screen}");
+}
+
+#[tokio::test]
+async fn a_blank_visual_falls_back_to_editor() {
+    let mut app = edit_with(Some("   ".into()), Some(fake(r#"write "from editor""#))).await;
+    let screen = app.screen();
+    assert!(screen.contains("from editor"), "{screen}");
 }
 
 #[tokio::test]

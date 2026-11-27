@@ -140,15 +140,20 @@ impl Keyboard {
 
 /// Runs the editor with the terminal handed over (ADR 0003 § 5): keyboard thread stopped and joined, TUI mode left,
 /// `EditRequest::run` on a blocking thread, TUI mode entered again, new keyboard thread, full repaint, result given
-/// to the screen. On an error, the TUI mode may be half entered: the caller ends `run`, which restores the
-/// terminal; the keyboard thread is then already stopped.
+/// to the screen. Keys the old keyboard thread had already queued after the editor key are dropped, they were
+/// typed for the TUI, not for the text coming back (see [`drop_queued_keys`]). On an error, the TUI mode may be
+/// half entered: the caller ends `run`, which restores the terminal; no keyboard thread is running then (the new
+/// one starts last).
 async fn edit<B: ratatui::backend::Backend<Error = io::Error>>(
     ui: &mut Ui<B>,
     request: EditRequest,
     keyboard: Keyboard,
     tx: &mpsc::UnboundedSender<Message>,
+    rx: &mut mpsc::UnboundedReceiver<Message>,
 ) -> io::Result<Keyboard> {
     keyboard.stop();
+    // The thread is joined: nothing more can be queued by it.
+    drop_queued_keys(rx, tx);
     restore_terminal();
     // Best effort: an editor that draws its own cursor does not need it.
     let _ = execute!(io::stdout(), Show);
@@ -160,10 +165,41 @@ async fn edit<B: ratatui::backend::Backend<Error = io::Error>>(
             })
         });
     enter_tui_mode()?;
-    let keyboard = Keyboard::start(tx)?;
+    // Before the keyboard thread starts: if the repaint fails, no thread is left running.
     ui.clear()?;
+    // The terminal's own queue: crossterm may hold key events read from the tty before the editor ran or typed
+    // during the editor's last moments; they are stale. Drained right before the new keyboard thread, in raw mode.
+    // No automatic test: it needs a pty.
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?; // Discarded on purpose: stale input.
+    }
+    let keyboard = Keyboard::start(tx)?;
     ui.finish_edit(result);
     Ok(keyboard)
+}
+
+/// Removes the key presses and pastes already queued in `rx` (sent by a keyboard thread between the editor key and
+/// its stop, up to one poll period), and puts every other message back, in order: a failure of the old thread
+/// still ends the loop; ticks and resizes stay harmless. Called only once that thread is joined, with the loop being
+/// the only reader of `rx`: no new message arrives in between. Network answers do not pass here (they come through
+/// `Ui::recv_background`).
+///
+/// Chosen over a generation number: no change to `Message` or to the thread, and a keyboard thread that is
+/// joined cannot send afterwards, so "everything queued now" is exactly "everything stale".
+fn drop_queued_keys(
+    rx: &mut mpsc::UnboundedReceiver<Message>,
+    tx: &mpsc::UnboundedSender<Message>,
+) {
+    let mut kept = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        if !matches!(message, Message::Input(Input::Key(_) | Input::Paste(_))) {
+            kept.push(message);
+        }
+    }
+    for message in kept {
+        // Cannot fail: `rx` is alive, we hold it.
+        let _ = tx.send(message);
+    }
 }
 
 /// The event loop, between terminal set-up and restoration.
@@ -184,7 +220,7 @@ async fn drive<B: ratatui::backend::Backend<Error = io::Error>>(mut ui: Ui<B>) -
                     ui.input(input);
                     if let Some(request) = ui.take_edit() {
                         let current = keyboard.take().expect("the keyboard thread runs between edits");
-                        match edit(&mut ui, request, current, &tx).await {
+                        match edit(&mut ui, request, current, &tx, &mut rx).await {
                             Ok(next) => keyboard = Some(next),
                             Err(error) => break Err(error),
                         }
@@ -250,6 +286,51 @@ mod tests {
         .join()
         .expect("thread");
         count.load(Ordering::SeqCst)
+    }
+
+    fn key(c: char) -> Message {
+        Message::Input(Input::Key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char(c),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        )))
+    }
+
+    /// What `drop_queued_keys` leaves in a channel holding `messages`, as short tags.
+    fn after_drop(messages: Vec<Message>) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for message in messages {
+            tx.send(message).expect("send");
+        }
+        drop_queued_keys(&mut rx, &tx);
+        let mut left = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            left.push(match message {
+                Message::Input(Input::Key(_)) => "key".to_owned(),
+                Message::Input(Input::Paste(_)) => "paste".to_owned(),
+                Message::Input(Input::Resize) => "resize".to_owned(),
+                Message::Tick => "tick".to_owned(),
+                Message::Failed(error) => format!("failed:{error}"),
+            });
+        }
+        left
+    }
+
+    #[test]
+    fn keys_and_pastes_queued_before_the_editor_are_dropped_the_rest_is_kept_in_order() {
+        let left = after_drop(vec![
+            key('a'),
+            Message::Tick,
+            Message::Input(Input::Paste("x".into())),
+            Message::Input(Input::Resize),
+            key('b'),
+            Message::Failed(io::Error::other("boom")),
+        ]);
+        assert_eq!(left, ["tick", "resize", "failed:boom"]);
+    }
+
+    #[test]
+    fn dropping_from_an_empty_channel_is_fine() {
+        assert!(after_drop(Vec::new()).is_empty());
     }
 
     #[test]

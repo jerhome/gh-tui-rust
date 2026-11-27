@@ -59,14 +59,22 @@ enum Phase {
 enum WritingAction {
     Publish,
     Cancel,
+    /// Help row only: `Ctrl-E` is taken by the text field first (it asks for the editor).
+    Edit,
 }
 
-const WRITING: [Binding<WritingAction>; 2] = [
+const WRITING: [Binding<WritingAction>; 3] = [
     Binding {
         label: "Ctrl-S",
         what: "Review, then publish",
         action: WritingAction::Publish,
         keys: &[(KeyCode::Char('s'), KeyModifiers::CONTROL)],
+    },
+    Binding {
+        label: "Ctrl-E",
+        what: "Open $VISUAL / $EDITOR",
+        action: WritingAction::Edit,
+        keys: &[(KeyCode::Char('e'), KeyModifiers::CONTROL)],
     },
     Binding {
         label: "Esc",
@@ -197,7 +205,8 @@ impl ComposeScreen {
                     ));
                 }
             }
-            None => {}
+            // Ctrl-E never gets here (the text field handled it); the row is for the help.
+            Some(WritingAction::Edit) | None => {}
         }
         Flow::Handled
     }
@@ -600,7 +609,7 @@ mod tests {
             for phase in [Phase::Writing, Phase::Confirm] {
                 compose.phase = phase;
                 let rows = compose.help();
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), if phase == Phase::Writing { 3 } else { 2 });
                 for row in rows {
                     assert!(row.label.chars().count() <= 8 && row.what.chars().count() <= 26);
                 }

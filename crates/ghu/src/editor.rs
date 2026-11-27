@@ -4,6 +4,7 @@
 //! (`spawn_blocking` in `terminal.rs`, called directly by the test harness).
 
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -30,11 +31,22 @@ pub(crate) struct EditorVars {
 /// A request to edit a text in the user's editor, taken from [`crate::Ui::take_edit`].
 ///
 /// `Send`; owns its data (the editor variables and the text), so it can move to a blocking thread.
-#[derive(Debug)]
 pub struct EditRequest {
     vars: EditorVars,
     text: String,
     returned_at_once: Duration,
+}
+
+/// Never prints the text (it may be a private draft): only the variables, its length in chars and the threshold
+/// (ADR 0003 § 9).
+impl fmt::Debug for EditRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EditRequest")
+            .field("vars", &self.vars)
+            .field("chars", &self.text.chars().count())
+            .field("returned_at_once", &self.returned_at_once)
+            .finish()
+    }
 }
 
 impl EditRequest {
@@ -85,16 +97,15 @@ impl EditRequest {
         let path =
             temp_file(dir, &self.text).map_err(|error| io_error("temporary file", &error))?;
         let start = Instant::now();
-        let status = Command::new(&program)
-            .args(&args)
-            .arg(&*path)
-            .status()
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::NotFound => EditorError::NotFound {
-                    program: program.to_string_lossy().into_owned(),
-                },
-                _ => io_error("cannot start the editor", &error),
-            })?;
+        let status =
+            editor_command(&program, &args, &path)
+                .status()
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::NotFound => EditorError::NotFound {
+                        program: program.to_string_lossy().into_owned(),
+                    },
+                    _ => io_error("cannot start the editor", &error),
+                })?;
         let elapsed = start.elapsed();
         if !status.success() {
             return Err(EditorError::Failed {
@@ -135,6 +146,18 @@ fn command(vars: &EditorVars) -> Result<(OsString, Vec<String>), EditorError> {
         .filter(|program| !program.is_empty())
         .ok_or(EditorError::Unparsable { var })?;
     Ok((OsString::from(program), words.collect()))
+}
+
+/// The editor process: the terminal's stdio, and no GitHub token in its environment (an editor, or a plugin of
+/// it, has no business reading them).
+fn editor_command(program: &OsString, args: &[String], path: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .arg(path)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
+    command
 }
 
 /// `vi`, or `notepad` on Windows.
@@ -244,6 +267,14 @@ pub enum EditorError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_of_a_request_never_shows_the_text() {
+        let request = EditRequest::new(EditorVars::default(), "my secret!".to_owned() + "ab");
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("chars: 12"), "{shown}");
+    }
+
     use super::*;
 
     fn vars(visual: Option<&str>, editor: Option<&str>) -> EditorVars {
@@ -307,6 +338,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_editor_does_not_inherit_the_github_tokens() {
+        let command = editor_command(
+            &OsString::from("ed"),
+            &["-x".to_owned()],
+            Path::new("file.md"),
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(name), None)),
+                "{name} must be removed: {envs:?}"
+            );
+        }
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-x", "file.md"]);
+    }
+
     /// Unix: an editor written in `sh` records the mode of the file it received (`ls -l`) next to it; the
     /// temporary file itself is gone after the run.
     #[cfg(unix)]
@@ -337,7 +386,12 @@ mod tests {
             "{left:?}"
         );
         let mode = std::fs::read_to_string(dir.path().join(&left[0])).expect("mode");
-        assert!(mode.starts_with("-rw------- "), "{mode}");
+        // Only the 10 mode characters: a suffix follows on SELinux ('.') or macOS ('@').
+        assert_eq!(
+            mode.chars().take(10).collect::<String>(),
+            "-rw-------",
+            "{mode}"
+        );
     }
 
     #[cfg(unix)]

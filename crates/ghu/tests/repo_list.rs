@@ -437,6 +437,22 @@ async fn q_and_question_mark_typed_in_the_filter_are_text() {
 }
 
 #[tokio::test]
+async fn f1_in_the_filter_keeps_the_text_and_q_in_the_help_does_not_quit() {
+    let mut app = Harness::start(filter_state()).await;
+    app.settle().await;
+    app.press(KeyCode::Char('/'));
+    app.type_text("wid");
+    app.press(KeyCode::F(1));
+    assert!(app.screen().contains("Toggle this help"));
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    app.press(KeyCode::Esc);
+    let screen = app.screen();
+    assert!(screen.contains("Filter: wid"), "{screen}");
+    assert!(!screen.contains("Toggle this help"), "{screen}");
+}
+
+#[tokio::test]
 async fn a_paste_appends_to_the_filter() {
     let mut app = Harness::start(filter_state()).await;
     app.settle().await;

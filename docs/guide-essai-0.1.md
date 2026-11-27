@@ -134,8 +134,8 @@ son nom). PRs de `alice/notes` : #1 ouverte (bob), #2 brouillon (carol), #3 ferm
 ### A6. Comment
 
 1. Sur `alice/notes#1`, `c`, taper `Premier essai` sur deux lignes (`Enter` entre les deux).
-   Attendu : zone de saisie ; aide en bas `Ctrl-S publish… · Ctrl-E editor · Esc cancel` ; `q` et `?`
-   s'écrivent dans le texte.
+   Attendu : zone de saisie ; aide en bas `Ctrl-S publish… · Ctrl-E editor · Esc cancel · F1 help` ; `q` et `?`
+   s'écrivent dans le texte. `F1` : aide de la saisie (`Ctrl-S`, `Ctrl-E`, `Esc`), texte intact ; `F1` ou `Esc` la ferme.
 2. `Ctrl-S`. Attendu : écran de confirmation qui montre le texte ; aucune requête `POST` dans le terminal 1.
 3. `?` dans la confirmation. Attendu : aide `y/Enter` Publish, `n/Esc` Back to the text. Fermer.
 4. `n`. Attendu : retour au texte, intact. `Ctrl-S` puis `y`.

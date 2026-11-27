@@ -69,12 +69,13 @@ pub(crate) enum Global {
 /// The global key map, shown last in the help.
 pub(crate) const GLOBAL: [Binding<Global>; 4] = [
     Binding {
-        label: "?",
+        label: "? / F1",
         what: "Toggle this help",
         action: Global::ToggleHelp,
         keys: &[
             (KeyCode::Char('?'), KeyModifiers::NONE),
             (KeyCode::Char('?'), KeyModifiers::SHIFT),
+            (KeyCode::F(1), KeyModifiers::NONE),
         ],
     },
     Binding {
@@ -96,6 +97,11 @@ pub(crate) const GLOBAL: [Binding<Global>; 4] = [
         keys: &[(KeyCode::Char('c'), KeyModifiers::CONTROL)],
     },
 ];
+
+/// `true` for `F1`, which opens the help from anywhere, text entry included (`?` is text there).
+pub(crate) fn is_f1(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(1) && key.modifiers == KeyModifiers::NONE
+}
 
 /// `true` for `Ctrl-C`, which quits from anywhere, text entry included.
 pub(crate) fn is_ctrl_c(key: KeyEvent) -> bool {

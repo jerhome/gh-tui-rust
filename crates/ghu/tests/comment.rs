@@ -283,24 +283,12 @@ async fn wide_characters_are_shown_and_published_as_they_are() {
 }
 
 #[tokio::test]
-async fn ctrl_e_has_no_effect_before_the_editor_lot_and_the_other_screens_are_not_ready() {
+async fn ctrl_e_has_no_effect_before_the_editor_lot() {
     let mut app = compose().await;
     app.type_text("ab");
     app.press_with(KeyCode::Char('e'), KeyModifiers::CONTROL);
     assert_on_screen(&mut app, HINT);
     assert_eq!(publish_and_read_body(&mut app).await, "ab");
-
-    // Review screens keep the provisional notice and never publish.
-    let mut app = open_detail(state_with(vec![pr("bob")])).await;
-    for key in ['a', 'x'] {
-        app.press(KeyCode::Char(key));
-        assert_on_screen(&mut app, "Not available yet.");
-        ctrl_s(&mut app);
-        app.press(KeyCode::Char('y'));
-        app.press(KeyCode::Esc);
-        assert_on_screen(&mut app, "Verdicts: none");
-    }
-    assert!(posts(&app).is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------------------------

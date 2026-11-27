@@ -73,4 +73,10 @@ pub enum Error {
         /// What was wrong.
         message: String,
     },
+    /// A text refused before sending ([`crate::MessageBody::new`]). No request was made.
+    #[error("invalid text: {problem:?}")]
+    InvalidBody {
+        /// Why the text was refused.
+        problem: crate::BodyProblem,
+    },
 }

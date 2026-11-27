@@ -27,6 +27,12 @@ pub struct State {
     pub failures: Vec<Failure>,
     /// Every request received, oldest first, including refused ones.
     pub requests: Vec<RecordedRequest>,
+    /// Instant written in objects created by `POST` routes (`created_at` of a Comment, `submitted_at` of a
+    /// Review, `updated_at` of the PR), `YYYY-MM-DDTHH:MM:SSZ` (served as is, not checked). Default
+    /// `2026-04-01T12:00:00Z`; tests set it to tell old and new entries apart (ADR 0003).
+    pub now: String,
+    /// Next id given to a created Comment or Review, then incremented. Default `1_000_000`.
+    pub next_id: u64,
 }
 
 impl State {
@@ -41,7 +47,16 @@ impl State {
             max_per_page: 100,
             failures: Vec::new(),
             requests: Vec::new(),
+            now: "2026-04-01T12:00:00Z".to_owned(),
+            next_id: 1_000_000,
         }
+    }
+
+    /// The PR `number` of `owner/repo` (owner and repo compared case-insensitively), for tests to edit its
+    /// reviews, comments and files. `None` if there is none. Never panics.
+    pub fn pull_mut(&mut self, owner: &str, repo: &str, number: u64) -> Option<&mut Pull> {
+        let _ = (owner, repo, number);
+        todo!("ADR 0003, wave 1: dev[fake]")
     }
 
     /// Demo data (also used by the `gh-fake` binary). Fictional names only. Must keep what #2's tests rely on:
@@ -199,11 +214,24 @@ pub struct Pull {
     pub head: String,
     /// Target branch (`base.ref`).
     pub base: String,
+    /// `head.sha` (ADR 0003). [`Pull::new`]: the number as 40 lowercase hex digits (`format!("{number:040x}")`).
+    pub head_sha: String,
+    /// `mergeable`; `None` serves `null` (still computed). [`Pull::new`]: `Some(true)`.
+    pub mergeable: Option<bool>,
+    /// Changed files, in the order served by `GET …/pulls/{n}/files`. [`Pull::new`]: empty. `additions`,
+    /// `deletions` and `changed_files` of the PR are computed from them.
+    pub files: Vec<PullFile>,
+    /// Reviews, chronological (served in this order, `PENDING` included, as GitHub does for the token's user).
+    /// [`Pull::new`]: empty.
+    pub reviews: Vec<PullReview>,
+    /// Conversation comments, served sorted by id. [`Pull::new`]: empty.
+    pub comments: Vec<IssueComment>,
 }
 
 impl Pull {
     /// An open, non-draft PR of `owner/repo` by `author`, without body, created and updated at
-    /// `2026-01-01T00:00:00Z`, from `feature` into `main`.
+    /// `2026-01-01T00:00:00Z`, from `feature` into `main`; head sha from the number, mergeable, no file, review
+    /// nor comment.
     pub fn new(owner: &str, repo: &str, number: u64, title: &str, author: &str) -> Self {
         Self {
             owner: owner.to_owned(),
@@ -218,8 +246,107 @@ impl Pull {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             head: "feature".to_owned(),
             base: "main".to_owned(),
+            head_sha: format!("{number:040x}"),
+            mergeable: Some(true),
+            files: Vec::new(),
+            reviews: Vec::new(),
+            comments: Vec::new(),
         }
     }
+}
+
+/// A changed file of a PR (JSON of "List pull requests files": `filename`, `previous_filename`, `status`,
+/// `additions`, `deletions`, `changes`, `patch`, plus `sha`, `blob_url`, `raw_url`, `contents_url`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullFile {
+    /// `filename`: path in the head commit.
+    pub filename: String,
+    /// Served as `previous_filename` when `Some` (absent otherwise).
+    pub previous_filename: Option<String>,
+    /// `status`.
+    pub status: FileStatus,
+    /// `additions`.
+    pub additions: u64,
+    /// `deletions`.
+    pub deletions: u64,
+    /// `None`: the `patch` key is absent (binary, too large, rename without change).
+    pub patch: Option<String>,
+}
+
+impl PullFile {
+    /// A [`FileStatus::Modified`] file without previous name, whose `additions` and `deletions` count the lines
+    /// of `patch` starting with `+` / `-` (lines split as `str::lines`).
+    pub fn modified(filename: &str, patch: &str) -> Self {
+        let _ = (filename, patch);
+        todo!("ADR 0003, wave 1: dev[fake]")
+    }
+}
+
+/// `status` of a changed file, served in lowercase (`added`, `removed`…).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileStatus {
+    /// `added`.
+    Added,
+    /// `removed`.
+    Removed,
+    /// `modified`.
+    Modified,
+    /// `renamed`.
+    Renamed,
+    /// `copied`.
+    Copied,
+    /// `changed`.
+    Changed,
+    /// `unchanged`.
+    Unchanged,
+}
+
+/// A review (JSON of "List reviews for a pull request": `id`, `user`, `body`, `state`, `commit_id`,
+/// `submitted_at` (absent when `None`), `html_url`, `author_association`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullReview {
+    /// `id`.
+    pub id: u64,
+    /// Author login; `None` serves `"user": null`.
+    pub author: Option<String>,
+    /// `state`.
+    pub state: ReviewState,
+    /// `body` (GitHub sends `""` for none).
+    pub body: String,
+    /// `submitted_at`; `None`: the key is absent (Pending).
+    pub submitted_at: Option<String>,
+    /// `commit_id`.
+    pub commit_id: String,
+}
+
+/// `state` of a review, served as GitHub writes it (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`,
+/// `PENDING`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewState {
+    /// `APPROVED`.
+    Approved,
+    /// `CHANGES_REQUESTED`.
+    ChangesRequested,
+    /// `COMMENTED`.
+    Commented,
+    /// `DISMISSED`.
+    Dismissed,
+    /// `PENDING` (started on the website, not submitted).
+    Pending,
+}
+
+/// A conversation comment of a PR (JSON of "List issue comments": `id`, `user`, `body`, `created_at`,
+/// `updated_at` (same as `created_at`), `html_url`, `author_association`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueComment {
+    /// `id`.
+    pub id: u64,
+    /// Author login; `None` serves `"user": null`.
+    pub author: Option<String>,
+    /// `body`.
+    pub body: String,
+    /// `created_at`, served as is.
+    pub created_at: String,
 }
 
 /// State of a fake PR. Served as `state` `"open"` or `"closed"`, plus `merged_at`.

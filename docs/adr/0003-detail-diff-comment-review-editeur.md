@@ -1,11 +1,15 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Détail d'une PR, diff, Comment, Review et saisie dans l'éditeur externe
 
-Statut : **proposée** (2026-11-26 17:07), à accepter après les relectures de #3, #4 et #5. Les points qui dépendent de
-l'API de `crates/ghu/src/ui.rs` telle qu'elle sortira de ces relectures sont marqués « à confirmer après #3-#5 ».
+Statut : **acceptée** (2026-11-27 11:45). Proposée le 2026-11-26 17:07, amendée le 2026-11-27 d'après la relecture
+`.claude/rv-adr-0003.md` (4 majeurs, 7 mineurs) ; seconde relecture OK avec trois mineurs (n1 mode `keep` du faux
+éditeur, n2 départ de la vague 2, n3 seuil `ReturnedAtOnce` réglable), corrigés à l'acceptation.
+Les relectures de #3, #4 et #5 sont faites et commitées (3e7c5f9, cc81eb6) et l'ADR 0002 est acceptée : les
+anciens points « à confirmer après #3-#5 » sont tranchés d'après le code de `main` (fefff13) et remplacés ci-dessous
+par la décision confirmée.
 
 Les tickets #6 (détail d'une PR), #7 (Diff), #8 (Comment), #9 (saisie dans `$EDITOR`) et #10 (Review Approve /
 Request changes) ajoutent sept routes au client et au faux serveur, quatre écrans à `ghu`, la première requête
@@ -32,7 +36,7 @@ l'OpenAPI `github/rest-api-description`, comme pour `pulls.json`.
 | Méthode | Route | Réponse (champs lus) | Ticket |
 |---|---|---|---|
 | `current_user` | `GET /user` | objet user : `login` | #6 (Own PR) |
-| `pull` | `GET /repos/{o}/{r}/pulls/{n}` | `number`, `title`, `user` (nullable), `state`, `draft`, `merged_at`, `body` (nullable), `head.label`, `head.ref`, `head.sha`, `base.ref`, `mergeable` (`true` / `false` / `null`), `created_at`, `updated_at`, `additions`, `deletions`, `changed_files` | #6 |
+| `pull` | `GET /repos/{o}/{r}/pulls/{n}` | `number`, `title`, `user` (nullable), `state`, `draft`, `merged_at`, `body` (nullable), `head.label`, `head.ref`, `head.sha`, `base.ref`, `base.repo.archived`, `mergeable` (`true` / `false` / `null`), `created_at`, `updated_at`, `additions`, `deletions`, `changed_files` | #6 |
 | `reviews` | `GET /repos/{o}/{r}/pulls/{n}/reviews` | tableau, ordre chronologique : `id`, `user` (nullable), `body`, `state` (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`, `PENDING`), `submitted_at` (absent pour `PENDING`) | #6 |
 | `comments` | `GET /repos/{o}/{r}/issues/{n}/comments` | tableau, `id` croissant : `id`, `user` (nullable), `body` (facultatif), `created_at` | #6 |
 | `pull_files` | `GET /repos/{o}/{r}/pulls/{n}/files` | tableau (3000 fichiers au plus côté GitHub) : `filename`, `previous_filename` (renommage), `status` (`added`, `removed`, `modified`, `renamed`, `copied`, `changed`, `unchanged`), `additions`, `deletions`, `patch` (absent pour un binaire ou un diff trop gros) | #7 |
@@ -94,6 +98,9 @@ pub struct PullDetail {
     pub base_ref: String,
     /// `head.sha`: the commit a Review is given on (post_review).
     pub head_sha: CommitSha,
+    /// `base.repo.archived`, read at each load (a repo archived during the session is seen after `r`).
+    /// false when `base.repo` is null or `archived` is absent (GitHub then refuses with 403, which has its message).
+    pub archived: bool,
     pub mergeable: Mergeable,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -352,14 +359,17 @@ Routes ajoutées (même chaîne : latence, enregistrement, authentification, pan
 
 ### 3. Socle `ghu/src/ui.rs` : ajouts (vague 0, architecte)
 
-À confirmer après #3-#5 : l'ADR 0002 amendée retire `Flow::Pop` et fait empiler `Shared::push` après `key`
-comme après `apply`. Les ajouts ci-dessous en sont le pendant pour fermer un écran.
+Confirmé d'après le code (fefff13) : `Flow` n'a plus que `Ignored`, `Handled` et `Push` (`ui.rs:161`) ;
+`App::key` et `App::apply` empilent tous deux `shared.pushed` après l'appel (`ui.rs:327`, `ui.rs:364`) ; le retour
+arrière existant est `App::pop` (`ui.rs:331`). Les ajouts ci-dessous en sont le pendant pour fermer un écran ; ils
+réutilisent `App::pop`.
 
 ```rust
 pub(crate) enum Outcome {
     // ... Repos, Repo, Pulls, TaskFailed ...
     /// The four requests of the PR detail, joined (tokio::try_join!): the first error wins.
-    PrPage(gh_client::Result<pr_detail::PrPage>),
+    /// Boxed: a PrPage is several times larger than the other variants (clippy large_enum_variant).
+    PrPage(gh_client::Result<Box<pr_detail::PrPage>>),
     /// Client::pull_files.
     Files(gh_client::Result<Vec<gh_client::FileChange>>),
     /// Client::post_comment.
@@ -376,8 +386,12 @@ pub(crate) enum Signal {
 }
 
 impl Shared {
-    /// Asks to close the top screen once the current call (key or apply) returns, before the screens asked for
-    /// by push are stacked; then gives `signal` to the new top (View::signal). Ignored on the root.
+    /// Asks to close the calling screen once the current call (key or apply) returns, then gives `signal` to
+    /// the screen below, which becomes the top (View::signal). Ignored on the root.
+    /// Only the top screen may call it: a request made by a lower screen during apply is a bug
+    /// (debug_assert in App; ignored with a tracing::warn in release). A call that asks pop returns
+    /// Flow::Handled (key) and calls neither Flow::Push nor Shared::push: debug_assert in App; in release the pop
+    /// wins and the screens asked for are dropped (tracing::warn).
     pub(crate) fn pop(&mut self, signal: Option<Signal>);
     /// Asks the loop to open the user's editor on `text` (#9). The latest request wins. The answer comes
     /// back through View::edited on the top screen.
@@ -397,7 +411,8 @@ pub(crate) trait View {
 
 impl<B: Backend> Ui<B> {
     /// The pending editor request, if a screen asked for one (Shared::request_edit). The caller suspends the
-    /// terminal, runs EditRequest::run (blocking), resumes, then calls finish_edit. Never blocks.
+    /// terminal, runs EditRequest::run off the async loop (spawn_blocking, § 5; the test harness may call it
+    /// directly), resumes, then calls finish_edit. Never blocks.
     pub fn take_edit(&mut self) -> Option<EditRequest>;
     /// Gives the editor's result to the top screen (View::edited). Ignored once finished.
     pub fn finish_edit(&mut self, result: Result<String, EditorError>);
@@ -408,8 +423,11 @@ impl<B: Backend> Ui<B> {
 ```
 
 `Shared` garde la valeur brute de `VISUAL` et `EDITOR` reçue du `Context` (`editor::EditorVars`), et la
-requête d'édition en attente. `App` traite, après chaque `key` et chaque `apply` : d'abord le `pop` demandé
-(puis `signal`), ensuite les écrans demandés par `push`.
+requête d'édition en attente. `App` traite, après chaque `key` et chaque `apply`, juste avant les
+`stack.append(&mut self.shared.pushed)` existants : si un `pop` est demandé, il vérifie que l'appelant était le
+sommet (dans `apply` : l'écran qui a rendu `None` est le dernier de la pile), appelle `App::pop`, puis `signal`
+sur le nouveau sommet ; un `pop` accompagné d'écrans à empiler est le bug décrit dans la doc de `pop`. Sans `pop`
+demandé, rien ne change pour les écrans existants.
 
 ### 4. Écrans (un module par écran, ADR 0002)
 
@@ -426,10 +444,10 @@ pub(crate) struct PrPage {
     pub(crate) comments: Vec<gh_client::Comment>,
     pub(crate) viewer: gh_client::User,
 }
-pub(crate) struct PrDetailScreen { /* repo: Repo, number: PrNumber, content, scroll, pending… */ }
+pub(crate) struct PrDetailScreen { /* repo: RepoName, number: PrNumber, content, scroll, pending… */ }
 impl PrDetailScreen {
-    /// Opened by Enter on the PR list; starts loading the PrPage at once.
-    pub(crate) fn new(repo: gh_client::Repo, number: gh_client::PrNumber, shared: &mut Shared) -> Self;
+    /// Opened by Enter on the PR list (which passes repo.name.clone()); starts loading the PrPage at once.
+    pub(crate) fn new(repo: gh_client::RepoName, number: gh_client::PrNumber, shared: &mut Shared) -> Self;
 }
 /// What the user may do on this PR (pure, tested in unit tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,8 +461,9 @@ pub(crate) enum Actions {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal { Archived, Closed, Merged }
-/// Archived beats Closed / Merged, which beat Own PR. Own PR: author == viewer, ASCII case-insensitive.
-pub(crate) fn actions(repo: &gh_client::Repo, pull: &gh_client::PullDetail, viewer: &gh_client::User) -> Actions;
+/// Archived (PullDetail::archived, fresh at each load) beats Closed / Merged, which beat Own PR.
+/// Own PR: author == viewer, ASCII case-insensitive. The Repo loaded at start-up is not used (it may be stale).
+pub(crate) fn actions(pull: &gh_client::PullDetail, viewer: &gh_client::User) -> Actions;
 /// Current verdict per reviewer: the latest Approved / ChangesRequested / Dismissed review of each author,
 /// in the order of those latest reviews; an author whose latest is Dismissed is left out; Commented is not a
 /// verdict.
@@ -474,19 +493,27 @@ descend pas sous la dernière ligne, et `Up` réagit dès la première pression 
 rendu est gardé dans une `Cell`). Erreur : `Cannot load the pull request: <raison>` en rouge, `r` réessaie.
 `signal(Published)` : recharge, puis défile jusqu'à la fin une fois la réponse arrivée.
 
-**Markdown rendu simple** (`ui/text.rs`, ligne par ligne, sans dépendance) : `#` à `######` + espace → titre en gras
-(sans les `#`) ; tiret, astérisque ou plus suivi d'une espace → puce `•` ; numéro suivi d'un point : gardé ; blocs
-délimités par trois accents graves ou par `~~~` → lignes en retrait de deux espaces, style atténué, rien d'interprété
-dedans ; `**x**` et `__x__` → gras ; `` `x` `` → style code ; liens, images, HTML, tableaux, citations : laissés tels
-quels (texte). Aucun cas ne panique (entrée quelconque, test).
+**Fins de ligne** (descriptions, Comments, Reviews et patchs) : tout texte venu du réseau est découpé en lignes
+comme `str::lines()` (un `\r` juste avant `\n` est retiré : `\r\n` et `\n` finissent une ligne) ; seul un `\r`
+isolé, au milieu d'une ligne, arrive à `text::clean` et devient `�`. GitHub renvoie `\r\n` pour un texte tapé sur
+le site, et les patchs de fichiers CRLF gardent leurs `\r`.
+
+**Markdown rendu simple** (`ui/text.rs`, ligne par ligne après le découpage ci-dessus, sans dépendance) :
+`#` à `######` + espace → titre en gras (sans les `#`) ; tiret, astérisque ou plus suivi d'une espace → puce
+`•` ; numéro suivi d'un point : gardé ; blocs délimités par trois accents graves ou par `~~~` → lignes en retrait
+de deux espaces, style atténué, rien d'interprété dedans ; `**x**` et `__x__` → gras ; `` `x` `` → style code ;
+liens, images, HTML, tableaux, citations : laissés tels quels (texte). Aucun cas ne panique (entrée quelconque,
+test).
 
 ```rust
 // ui/text.rs (#6; used by every screen that shows network text)
 /// Text safe to draw: tab → 4 spaces; other control characters (C0, DEL, C1), bidi embedding / override /
-/// isolate marks (U+202A..=U+202E, U+2066..=U+2069) and U+FEFF → U+FFFD. Newlines are the caller's (split
-/// before). Borrowed when nothing changes.
+/// isolate marks (U+202A..=U+202E, U+2066..=U+2069) and U+FEFF → U+FFFD. Newlines are the caller's: it splits
+/// with str::lines() first (\n and \r\n end a line), so only a lone \r reaches clean and becomes U+FFFD.
+/// Borrowed when nothing changes.
 pub(crate) fn clean(text: &str) -> std::borrow::Cow<'_, str>;
-/// The Markdown subset above, as styled lines (each line cleaned). `indent` spaces before each line.
+/// The Markdown subset above, as styled lines (split with str::lines(), each line cleaned). `indent` spaces
+/// before each line.
 pub(crate) fn markdown(text: &str, indent: usize) -> Vec<ratatui::text::Line<'static>>;
 ```
 
@@ -502,9 +529,10 @@ impl DiffScreen {
 **Diff (#7)**. Titre : `<owner/name> · #<n> · Diff`. À gauche (un tiers de la largeur, au moins 24 colonnes) la
 liste des fichiers, une ligne chacun : marque `>` du fichier choisi, lettre d'état (`A`, `D`, `M`, `R`, `C`,
 `M` pour Changed, ` ` pour Unchanged), `+<a> -<d>`, chemin coupé avec `…`. À droite le fichier choisi : une
-ligne d'en-tête (`<chemin>`, ou `<ancien> → <nouveau>`), puis le patch sans renvoi à la ligne, `+` en vert,
-`-` en rouge, `@@` en cyan, `\` atténué. Sans patch : `Renamed from <ancien>, no content change.` (renommé,
-`+0 -0`) ou `No diff from GitHub: binary file, or too large to show.` Liste vide : `No changed files.` Touches :
+ligne d'en-tête (`<chemin>`, ou `<ancien> → <nouveau>`), puis le patch (découpé comme `str::lines()`, voir
+« Fins de ligne ») sans renvoi à la ligne, `+` en vert, `-` en rouge, `@@` en cyan, `\` atténué. Sans patch :
+`Renamed from <ancien>, no content change.` (renommé, `+0 -0`) ou `No diff from GitHub: binary file, or too large
+to show.` Liste vide : `No changed files.` Touches :
 `n` fichier suivant, `p` précédent (bornés ; défilement remis à zéro), `Up/k` `Down/j`, `PgUp` `PgDn`,
 `Left/h` `Right/l` (8 colonnes), `r` recharger. Erreur : `Cannot load the changed files: <raison>`.
 
@@ -574,10 +602,13 @@ impl ComposeScreen {
 Succès : `Shared::pop(Some(Signal::Published))` et notice `Comment published.` / `Review published: Approve.` /
 `Review published: Request changes.` ; le détail se recharge. Échec : retour à Writing, texte intact, message
 rouge au-dessus de la zone : `Cannot publish the comment: <raison>` / `Cannot publish the review: <raison>`
-(`error_message`), sauf deux cas propres à la publication : 422 d'une Review → `GitHub refused the review (422).
-If you started a review on the website (pending review), submit or delete it there, then try again.` ; erreur
-réseau → `no answer from GitHub. It may have been published anyway: refresh the PR (Esc, r) before trying
-again.` Le texte publié n'est jamais construit ni complété par `ghu` : c'est celui de la zone, tel quel.
+(`error_message`), sauf trois cas propres à la publication : 422 d'une Review → `GitHub refused the review (422).
+If you started a review on the website (pending review), submit or delete it there; or the PR changed: refresh
+(Esc, r). Then try again.` (couvre aussi un force-push après le chargement, `commit_id` hors de la PR, et une PR
+fermée entre-temps) ; erreur réseau → `no answer from GitHub. It may have been published anyway: refresh the PR
+(Esc, r) before trying again.` ; `Outcome::TaskFailed` reçu pendant Publishing (tâche de publication paniquée) →
+traité comme l'erreur réseau : retour à Writing, texte intact, même message « may have been published ». Le texte
+publié n'est jamais construit ni complété par `ghu` : c'est celui de la zone, tel quel.
 
 ### 5. Éditeur externe (#9)
 
@@ -596,10 +627,27 @@ impl EditRequest {
     /// (`notepad` on Windows, cfg!(windows)); split on whitespace, double quotes group (no other escape, no
     /// shell). Writes `text` to a new temporary file `ghu-*.md` (tempfile, owner-only on Unix, removed after),
     /// runs `<program> <args…> <path>` with the terminal's stdin, stdout and stderr, waits without timeout,
-    /// then reads the file again by path (editors that replace the file are fine), at most 1 MiB.
+    /// then reads the file again by path (editors that replace the file are fine), bounded:
+    /// File::open + Read::take(MAX_EDITED_BYTES + 1) + read_to_end, TooLarge when more than MAX_EDITED_BYTES
+    /// came (never fs::read then a check). Program resolution is std's: on Windows only `.exe` is added to a
+    /// bare name, so a `.cmd` launcher must be named with its extension (`code.cmd --wait`).
+    /// ReturnedAtOnce when the editor exits with success less than the request's threshold (RETURNED_AT_ONCE
+    /// unless with_returned_at_once changed it) after the spawn and the file holds exactly the bytes written (an
+    /// editor that handed the file to another window and returned).
     /// Errors: see EditorError. Never panics.
     pub fn run(self) -> Result<String, EditorError>;
+    /// The same request with another ReturnedAtOnce threshold. For tests: a slow CI runner may take more than
+    /// 1 s to spawn the fake editor, so the positive test sets a large one (30 s); Duration::ZERO disables the
+    /// check. Production code never calls it.
+    pub fn with_returned_at_once(self, threshold: std::time::Duration) -> Self;
 }
+
+/// Most bytes read back from the edited file: 1 MiB.
+pub const MAX_EDITED_BYTES: u64 = 1_048_576;
+
+/// Default threshold of EditRequest: below this time between spawn and exit, an unchanged file means
+/// ReturnedAtOnce.
+pub const RETURNED_AT_ONCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Why the editor gave no text. The text being edited is kept in every case.
 #[derive(Debug, thiserror::Error)]
@@ -614,9 +662,12 @@ pub enum EditorError {
     /// Exited with a failure status (None: killed by a signal).
     #[error("editor failed: {code:?}")]
     Failed { code: Option<i32> },
-    /// More than 1 MiB written.
+    /// More than MAX_EDITED_BYTES written.
     #[error("edited text too large")]
     TooLarge,
+    /// Exited with success within the threshold (RETURNED_AT_ONCE by default), file unchanged: probably an editor that does not wait.
+    #[error("editor returned at once")]
+    ReturnedAtOnce,
     /// Not valid UTF-8.
     #[error("edited text is not UTF-8")]
     NotUtf8,
@@ -629,25 +680,47 @@ pub enum EditorError {
 Messages (notice rouge, `TextArea::edited`) : `Cannot read VISUAL: unbalanced quote or no program.` (ou
 `EDITOR`) ; `Cannot open the editor: <program> was not found. Set VISUAL or EDITOR.` ; `The editor failed (exit
 code <n>): the text is unchanged.` (`(stopped)` sans code) ; `The edited text is larger than 1 MiB: the text is
-unchanged.` ; `The edited text is not UTF-8: the text is unchanged.` ; `Cannot use the editor: <message>.`
+unchanged.` ; `The edited text is not UTF-8: the text is unchanged.` ; `The editor returned at once: the text is
+unchanged. Set VISUAL to an editor that waits (vim, nano, "code.cmd --wait").` ; `Cannot use the editor:
+<message>.`
+
+**Éditeur qui n'attend pas** (Windows surtout) : le Notepad à onglets de Windows 11 peut confier le fichier à une
+fenêtre déjà ouverte et rendre la main tout de suite (à vérifier à l'essai réel), comme `code` sans `--wait`.
+`ReturnedAtOnce` détecte le cas courant (moins d'1 s, contenu identique) et le dit, au lieu de rendre en silence
+un texte inchangé. Limites connues, notées pour la 0.1 : un éditeur qui rend la main après plus d'1 s sans
+attendre n'est pas détecté (texte inchangé, sans message) ; si l'utilisateur enregistre ensuite dans l'autre
+fenêtre, le fichier supprimé peut être recréé avec son texte dans le dossier temporaire ; si `ghu` est tué
+pendant l'édition (`Ctrl-C` dans la console pendant qu'un éditeur graphique est ouvert : le terminal n'est plus en
+mode brut), `TempPath` n'est pas supprimé. Parade possible plus tard : ignorer `SIGINT` / `CTRL_C_EVENT` pendant
+l'attente, comme git (pas dans ce lot).
+
+Éditeurs documentés (aide de #9 et guide d'essai) : `vim`, `nano`, `"code --wait"` sous Unix ;
+`"code.cmd --wait"` sous Windows (`code` seul n'est pas trouvé : `Command::new` n'ajoute que `.exe`), notepad
+par défaut.
 
 **Boucle réelle** (`terminal.rs`) : après chaque `ui.input`, si `ui.take_edit()` rend une requête : arrêter le
 fil clavier (`stop` + `join`, 200 ms au plus : il ne doit pas lire les touches destinées à l'éditeur), quitter le
-mode TUI (`restore_terminal`), `run()` sur le fil de la boucle (bloquant ; les tâches réseau continuent sur les
-autres fils du runtime multi-thread, leurs résultats attendent dans le canal), rentrer en mode TUI (mode brut,
+mode TUI (`restore_terminal`), `tokio::task::spawn_blocking(move || req.run()).await` (`EditRequest` est `Send` et
+possède ses données ; la boucle reste correcte sur un runtime current-thread, comme le promet la doc de `Ui` ; un
+`JoinError` devient `EditorError::Io`), rentrer en mode TUI (mode brut,
 écran alternatif, collage), relancer un fil clavier neuf, `ui.clear()`, `ui.finish_edit(result)`. Une erreur
 d'entrée / sortie en rentrant dans le mode TUI termine `run` comme aujourd'hui (terminal restauré).
 
 **Harnais** (`tests/support/mod.rs`) : après chaque touche envoyée (`press_with`, donc `press` et `type_text`),
 si `take_edit` rend une requête, le harnais la lance (`run()`) et rend le résultat par `finish_edit` ; aucun
-terminal à suspendre. Le chemin `run()` du code de production est donc celui des tests.
+terminal à suspendre. Le chemin `run()` du code de production est donc celui des tests. Le harnais applique à chaque
+requête un seuil réglable (`EditRequest::with_returned_at_once`, défaut `RETURNED_AT_ONCE`) : le test positif de
+`ReturnedAtOnce` le fixe à 30 s, pour ne pas dépendre de la vitesse de lancement d'un processus sur la CI Windows.
 
 **Faux éditeur** : binaire Rust `ghu-fake-editor` du crate `ghu` (`src/bin/fake_editor.rs`, `test = false`,
 `doc = false`), trouvé par les tests via `env!("CARGO_BIN_EXE_ghu-fake-editor")`. Le test le désigne par
 `EDITOR` dans `TestEnv` (jamais l'environnement du processus) : `"<chemin>" write "Hello\nfrom the editor"`
 (remplace le contenu ; `\n` littéral → saut de ligne), `"<chemin>" upper` (met le contenu reçu en majuscules :
 prouve l'aller-retour), `"<chemin>" fail 3` (sort avec le code 3), `"<chemin>" bytes` (écrit des octets non
-UTF-8). Éditeur introuvable : `EDITOR=/nonexistent/ghu-editor`. Le binaire n'écrit rien sur la sortie et ne lit
+UTF-8), `"<chemin>" fill <n>` (écrit `n` octets `a` : passe la borne d'1 Mio sans argument géant, qui
+dépasserait 128 Kio par argument sous Linux et 32 767 caractères de ligne de commande sous Windows),
+`"<chemin>" keep` (sort tout de suite avec le code 0 sans toucher au fichier : l'éditeur qui n'attend pas). Éditeur
+introuvable : `EDITOR=/nonexistent/ghu-editor`. Le binaire n'écrit rien sur la sortie et ne lit
 rien d'autre que son fichier.
 
 ### 6. Règles de publication (résumé)
@@ -673,7 +746,8 @@ rien d'autre que son fichier.
   n'atteint pas le terminal. On ne s'en remet pas à ce détail interne : tout texte venu du réseau (titres, logins,
   branches, descriptions, Comments, Reviews, chemins, patchs) passe par `text::clean`, qui rend visibles (U+FFFD)
   les contrôles et les marques bidi (« Trojan Source »). Test : un patch et un Comment contenant
-  `\u{1b}[31m`, `\u{202e}` et `\r` s'affichent avec `�`, sans séquence brute dans le tampon.
+  `\u{1b}[31m`, `\u{202e}` et un `\r` isolé (`a\rb`) s'affichent avec `�`, sans séquence brute dans le tampon ;
+  un Comment et un patch en `a\r\nb` s'affichent sur deux lignes sans `�` (« Fins de ligne », § 4).
 - **Éditeur** : lancé sans shell (aucune interprétation de `VISUAL` / `EDITOR` au-delà des guillemets) ; fichier
   temporaire créé par `tempfile` (création exclusive, droits 0600 sous Unix).
 
@@ -723,15 +797,21 @@ rien d'autre que son fichier.
 Effet sur l'existant :
 
 - `ui/pulls.rs` : `Enter` ouvre le détail de la PR choisie (aujourd'hui sans effet) ; aide `Enter Open the PR`.
-  Tests existants de `pull_list.rs` : rien (aucun n'appuie sur `Enter` dans la liste des PRs).
+  Tests existants : `ghu/tests/pull_list.rs:252` (`selection_is_bounded_and_enter_does_nothing_yet`) appuie sur
+  `Enter` et vérifie que la liste reste affichée ; il casse en vague 2. Le lot dev[tui-detail] le reprend
+  (renommé `selection_is_bounded_and_enter_opens_the_detail` : la sélection reste bornée, `Enter` ouvre le
+  détail de la PR choisie).
 - `ui.rs` : variantes d'`Outcome`, `Signal`, `Shared::pop`, `Shared::request_edit`, `View::signal`,
-  `View::edited`, `Ui::take_edit`, `Ui::finish_edit`, `Ui::clear` ; écrans existants : rien (méthodes par défaut).
-  À confirmer après #3-#5.
+  `View::edited`, `Ui::take_edit`, `Ui::finish_edit`, `Ui::clear` ; écrans existants : rien, confirmé d'après le
+  code (leurs `apply` finissent par `other => return Some(other)` : `pulls.rs:208`, `repo_list.rs:506`, `:534`,
+  `:559` ; nouvelles méthodes de `View` à corps par défaut). Constructions à compléter, toutes en vague 0 :
+  `Shared {..}` dans `Ui::new` et dans le test de `ui.rs` (l. 445), `Context {..}` dans `launch.rs:122`.
 - `launch.rs` : `Context` gagne `editor: EditorVars` (lus par `prepare`, sans effet si absents) ; `--help` et
   les codes de sortie : rien.
-- `terminal.rs` : la boucle sait suspendre le terminal ; sans édition, rien ne change.
-- `gh-client` : `Error` gagne `InvalidBody` (`error_message` tombe sur son cas générique, jamais atteint : la
-  saisie vérifie avant) ; la doc de `PullRequest` ne promet plus de champs de détail.
+- `terminal.rs` : la boucle sait suspendre le terminal ; sans édition, rien ne change. `spawn_blocking` est dans
+  la fonction `rt` de tokio, déjà tirée par `rt-multi-thread` : `ghu/Cargo.toml` inchangé pour tokio.
+- `gh-client` : `PullDetail` lit `base.repo.archived` ; `Error` gagne `InvalidBody` (`error_message` tombe sur
+  son cas générique, jamais atteint : la   saisie vérifie avant) ; la doc de `PullRequest` ne promet plus de champs de détail.
 - `gh-fake` : `Pull` gagne cinq champs (remplis par `Pull::new` : aucun test existant ne construit `Pull` par
   littéral), `State` deux ; démo enrichie sans changer les PRs de `alice/notes` en nombre ni en état.
 - Fichiers de l'utilisateur : aucun nouveau (le fichier temporaire est supprimé).
@@ -755,33 +835,64 @@ avant #7). La vague 0 donne donc à `DiffScreen` et `ComposeScreen` un corps pro
 tui-compose laisse la publication d'une Review sur ce message (notice `Not available yet.`) jusqu'à tui-review, et
 `Ctrl-E` sans effet jusqu'à tui-editor. Les `todo!()` restants ne sont atteints que par des tests.
 
+**Vague 0 faite** (2026-11-27) : les éléments pas encore appelés portent `#![expect(dead_code, reason = …)]` en tête
+de leur module (`editor.rs`, `ui/{pr_detail,diff,compose,text_area,text}.rs`) : le lot qui les branche retire
+l'attribut de son fichier quand le compilateur le signale (`unfulfilled_lint_expectations`). Dans `ui.rs`, gelé, ce
+sont des `#[allow(dead_code, reason = …)]` par élément (variantes d'`Outcome`, `Signal::Published`, `Shared::pop`,
+`Shared::request_edit`), à retirer par l'architecte après la vague 4. Écrits en vague 0 en plus de la plomberie :
+`TextArea::new`, `EditRequest::new` (`pub(crate)`) et `with_returned_at_once`, le `Debug` de `MessageBody`, les
+titres des écrans provisoires ; `Outcome::PrPage` porte un `Box<PrPage>` (clippy `large_enum_variant`) ; le faux
+éditeur sort avec le code 64 sur un usage invalide.
+
 | Vague | Lot (modèle) | Fichiers | Dépend de | Terminé quand |
 |---|---|---|---|---|
-| 0 | architecte (opus) : signatures | `gh-client/src/{model,error,client,lib}.rs` ; `gh-fake/src/{state,lib}.rs` ; `ghu/src/{ui.rs,launch.rs,lib.rs,editor.rs,bin/fake_editor.rs}`, `ghu/src/ui/{pr_detail,diff,compose,text_area,text}.rs` ; `ghu/Cargo.toml` | commit de #3-#5, ADR acceptée | `cargo check --workspace --all-targets` vert ; corps `todo!()` sauf plomberie de `ui.rs` (`pop`, `signal`, `request_edit`, `take_edit`, `finish_edit`, `clear`), capture des variables dans `prepare`, valeurs par défaut de `Pull::new` / `State::new` ; tests existants verts |
+| 0 | architecte (opus) : signatures | `gh-client/src/{model,error,client,lib}.rs` ; `gh-fake/src/{state,lib}.rs` ; `ghu/src/{ui.rs,launch.rs,lib.rs,editor.rs,bin/fake_editor.rs}`, `ghu/src/ui/{pr_detail,diff,compose,text_area,text}.rs` ; `ghu/Cargo.toml` | ADR acceptée | `cargo check --workspace --all-targets` vert ; corps `todo!()` sauf plomberie de `ui.rs` (`pop`, `signal`, `request_edit`, `take_edit`, `finish_edit`, `clear`), capture des variables dans `prepare`, valeurs par défaut de `Pull::new` / `State::new` ; tests existants verts |
 | 1 | dev[fake] (sonnet) | `gh-fake/src/routes.rs`, `gh-fake/src/state.rs` (corps : `pull_mut`, `PullFile::modified`, `demo`), `gh-fake/tests/routes.rs` | 0 | 7 routes ; tests par route : succès, 404, pagination des 3 listes, 403 archivé ×2, chaque 422 de `POST reviews`, 422 Comment blanc, Pending créée sans `event`, publication visible au `GET` suivant, `now` / `next_id` appliqués, `requests()` garde le corps ; démo : tests existants verts |
-| 1 | dev[client] (sonnet) | `gh-client/src/{client,wire,model}.rs` (corps), `gh-client/tests/http.rs`, `gh-client/tests/fixtures/*.json` (OpenAPI : pull, files, reviews, issue comments, user, review créée, comment créé) | 0 | décodage des exemples documentés ; `mergeable` 3 cas ; PENDING retirée ; état ou statut inconnu = `UnexpectedResponse` ; `patch` absent ou vide = `None` ; `MessageBody` (blanc, 65 536, 65 537, `Debug` sans texte) ; corps JSON des POST lus dans `requests()` (`event`, `body` omis si `None`, `commit_id`) ; 201 / 200 ; 403, 422, 404 classés ; jeton absent des erreurs |
-| 2 | dev[tui-detail] (sonnet) | `ghu/src/ui/{pr_detail,text}.rs`, `ghu/src/ui/pulls.rs` (`Enter`), `ghu/tests/pr_detail.rs` | 1 (fusionnée) | #6 : chaque critère au harnais (titre, auteur, branches, état, draft, mergeable / conflicts, Markdown, verdicts par reviewer, Pending ignorée, Dismissed, conversation ordonnée, défilement borné, `r`, `Esc` retour, chargement lent, 404 et 500 lisibles) ; lignes d'actions des 4 cas ; unitaires `actions`, `verdicts`, `clean`, `markdown` (sans panique sur entrée quelconque) ; test d'échappement du § 7 |
-| 3 | dev[tui-diff] (sonnet) | `ghu/src/ui/diff.rs`, `ghu/tests/diff.rs` | 2 | #7 : liste et compteurs, couleurs (style des cellules lu dans le tampon), `n` / `p` bornés, défilement vertical et horizontal, renommé sans changement, binaire, liste vide, pagination (> 100 fichiers avec `max_per_page` bas), erreur, échappement d'un patch hostile |
-| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête |
-| 4 | dev[tui-editor] (**opus**) | `ghu/src/editor.rs`, `ghu/src/bin/fake_editor.rs`, `ghu/src/ui/text_area.rs` (`Ctrl-E`, `edited`), `ghu/src/terminal.rs`, `ghu/tests/support/mod.rs`, `ghu/tests/editor.rs` | 3 (tui-compose) | #9 : ordre VISUAL > EDITOR > défaut (unitaire, défaut par `cfg`), découpage avec guillemets (unitaire), aller-retour (`upper`), `write` multi-ligne, introuvable, code 3, non UTF-8, > 1 Mio, fichier temporaire supprimé ; au harnais : texte revenu dans la zone puis publié ; essai réel par l'utilisateur (vim sous WSL, notepad sous Windows) |
-| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 Pending : message, texte conservé |
+| 1 | dev[client] (sonnet) | `gh-client/src/{client,wire,model}.rs` (corps), `gh-client/tests/http.rs`, `gh-client/tests/fixtures/*.json` (OpenAPI : pull, files, reviews, issue comments, user, review créée, comment créé) | 0 | teste **seul**, sans les routes de dev[fake] (voir « Vague 1 » sous le tableau) ; décodage des exemples documentés ; `archived` lu dans `base.repo` (`true`, `false`, `base.repo` null) ; `mergeable` 3 cas ; PENDING retirée ; état ou statut inconnu = `UnexpectedResponse` ; `patch` absent ou vide = `None` ; `MessageBody` (blanc, 65 536, 65 537, `Debug` sans texte) ; corps JSON des POST lus dans `requests()` (`event`, `body` omis si `None`, `commit_id`) ; 201 / 200 ; 403, 422, 404 classés ; jeton absent des erreurs |
+| 2 | dev[tui-detail] (sonnet) | `ghu/src/ui/{pr_detail,text}.rs`, `ghu/src/ui/pulls.rs` (`Enter`), `ghu/tests/pr_detail.rs`, `ghu/tests/pull_list.rs` (test `Enter` repris) | 1 (fusionnée) et `qa` bout-en-bout client ↔ faux | #6 : `selection_is_bounded_and_enter_opens_the_detail` vert ; chaque critère au harnais (titre, auteur, branches, état, draft, mergeable / conflicts, Markdown, verdicts par reviewer, Pending ignorée, Dismissed, conversation ordonnée, défilement borné, `r`, `Esc` retour, chargement lent, 404 et 500 lisibles) ; lignes d'actions des 4 cas, dont un repo archivé après le chargement puis `r` (actions retirées) ; unitaires `actions`, `verdicts`, `clean`, `markdown` (sans panique sur entrée quelconque) ; fins de ligne `a\r\nb` sans `�`, `a\rb` avec ; test d'échappement du § 7 |
+| 3 | dev[tui-diff] (sonnet) | `ghu/src/ui/diff.rs`, `ghu/tests/diff.rs` | 2 | #7 : liste et compteurs, couleurs (style des cellules lu dans le tampon), `n` / `p` bornés, défilement vertical et horizontal, renommé sans changement, binaire, liste vide, pagination (> 100 fichiers avec `max_per_page` bas), erreur, échappement d'un patch hostile, patch CRLF sans `�` |
+| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête ; `TaskFailed` pendant Publishing (unitaire) : retour à Writing, message « may have been published » |
+| 4 | dev[tui-editor] (**opus**) | `ghu/src/editor.rs`, `ghu/src/bin/fake_editor.rs`, `ghu/src/ui/text_area.rs` (`Ctrl-E`, `edited`), `ghu/src/terminal.rs`, `ghu/tests/support/mod.rs`, `ghu/tests/editor.rs` | 3 (tui-compose) | #9 : ordre VISUAL > EDITOR > défaut (unitaire, défaut par `cfg`), découpage avec guillemets (unitaire), aller-retour (`upper`), `write` multi-ligne, introuvable, code 3, non UTF-8, `fill 1048576` accepté et `fill 1048577` = `TooLarge`, `ReturnedAtOnce` (faux éditeur `keep`, seuil du harnais fixé à 30 s) et ses contre-épreuves (`write` rapide : pas de `ReturnedAtOnce` ; `keep` avec un seuil `Duration::ZERO` : texte rendu inchangé, sans erreur), fichier temporaire supprimé ; boucle réelle par `spawn_blocking` ; au harnais : texte revenu dans la zone puis publié ; essai réel par l'utilisateur (vim sous WSL, notepad sous Windows avec une fenêtre Notepad déjà ouverte, `code.cmd --wait`) |
+| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 (Pending ou PR changée) : message exact du § 4, texte conservé |
 
 Modèles : `sonnet` (tableau « Agents ») sauf **tui-editor en opus** : protocole fil clavier / terminal / processus
 externe, propre à chaque OS, que les tests au harnais ne couvrent pas (seul l'essai réel le fera) ; une erreur y
 laisse le terminal inutilisable.
 
-Ordre : vague 0 → vague 1 (fake ‖ client, indépendants) → `qa` + `relecteur` ×2 (réseau, parsing, jeton : relecture
-d'office) → vague 2 (tui-detail) → `qa` + relecteur → commit `Closes #6` → vague 3 (tui-diff ‖ tui-compose) →
-`qa` + relecteur → commit `Closes #7 #8` → vague 4 (tui-editor ‖ tui-review) → `qa` + relecteur ×2 (Standards,
-Spec) → commit `Closes #9 #10` → essai réel de l'utilisateur (éditeur, terminal, Windows). La vague 1 peut fusionner
-avant la relecture si la vague 2 doit démarrer, la relecture portant alors sur les deux.
+**Vague 1 : dev[fake] et dev[client] en parallèle, sans s'attendre.** En vague 0, `gh-fake/src/routes.rs` n'a pas
+les nouvelles routes (une requête vers elles reçoit le 404 générique) ; dev[client] ne teste donc pas ses succès
+contre le faux :
+
+- **Succès** (200 / 201, décodage, pagination) : le `scripted_server` de `gh-client/tests/http.rs`
+  (`http.rs:48`) sert les fixtures. Pour un `POST`, il doit lire le corps annoncé par `Content-Length` avant de
+  répondre (aujourd'hui il ne lit que l'en-tête : une socket fermée avec des octets non lus peut finir en RST
+  côté client) ; dev[client] l'étend dans `http.rs`.
+- **Erreurs 403 / 422 / 404 / limite de débit** : l'injection `Failure` du faux (`state.rs:247`), appliquée
+  avant le routage, sur le chemin et la méthode `POST` des nouvelles routes.
+- **Corps des `POST`** (`event`, `body` omis si `None`, `commit_id`) : `FakeGitHub::requests()`, qui
+  enregistre le corps JSON avant l'authentification et le routage (`routes.rs:135-148`), donc même sans route.
+- **Bout-en-bout client ↔ faux** (vraies routes de dev[fake], un test par méthode : succès et une erreur
+  propre au faux, 403 archivé ou 422 Own PR) : `qa` après la fusion des deux lots, dans un fichier neuf
+  `gh-client/tests/fake_roundtrip.rs` ; il conditionne le départ de la vague 2.
+
+Option écartée : enchaîner fake puis client (tests de succès contre le faux) : une session de plus sur le chemin
+critique, pour un gain que le passage de `qa` donne aussi.
+
+Ordre : vague 0 → vague 1 (fake ‖ client, indépendants) → `qa` (vérification complète + bout-en-bout client ↔
+faux) + `relecteur` ×2 (réseau, parsing, jeton : relecture d'office) → vague 2 (tui-detail) → `qa` + relecteur →
+commit `Closes #6` → vague 3 (tui-diff ‖ tui-compose) → `qa` + relecteur → commit `Closes #7 #8` → vague 4
+(tui-editor ‖ tui-review) → `qa` + relecteur ×2 (Standards, Spec) → commit `Closes #9 #10` → essai réel de
+l'utilisateur (éditeur, terminal, Windows). La vague 1 est fusionnée avant le passage de `qa`, qui écrit
+`fake_roundtrip.rs` sur la fusion ; la relecture peut porter sur les deux lots fusionnés. La vague 2 ne démarre
+jamais avant le bout-en-bout client ↔ faux de `qa`.
 
 **Goulots** : `ghu/src/ui.rs` (vague 0 seulement, puis gelé) ; `ghu/src/ui/text_area.rs` (tui-compose puis
 tui-editor, en séquence) ; `ghu/src/ui/compose.rs` (tui-compose puis tui-review, en séquence) ;
 `ghu/tests/support/mod.rs` (tui-editor seul ; un autre lot qui en aurait besoin le demande dans son rapport).
 
 Fichiers partagés : `Cargo.toml` racine et `Cargo.lock` → personne (aucun changement) ; `ghu/Cargo.toml`,
-`ui.rs`, `lib.rs` (les trois crates), `launch.rs` → vague 0 ; `gh-fake/src/state.rs` → vague 0 (types) puis
+`ui.rs`, `lib.rs` (les trois crates), `launch.rs` → vague 0 ; `ghu/tests/pull_list.rs` → dev[tui-detail] ;
+`gh-client/tests/fake_roundtrip.rs` (nouveau) → `qa` après la vague 1 ; `gh-fake/src/state.rs` → vague 0 (types) puis
 dev[fake] (corps) ; `docs/` → session principale et architecte.
 
 ## Risques
@@ -791,7 +902,9 @@ dev[fake] (corps) ; `docs/` → session principale et architecte.
 | Le fil clavier vole des touches à l'éditeur | `poll` de crossterm pendant l'édition | essai réel (taper dans vim) | fil arrêté et joint avant le lancement | revenir à `take_edit` sans éditeur (zone seule) |
 | Terminal mal restauré après l'éditeur (Windows) | console Windows, notepad | essai réel de l'utilisateur ; CI Windows ne le voit pas | `ui.clear()` + mode TUI refait ; erreur → sortie propre | désactiver `Ctrl-E` sous Windows (`cfg`) |
 | Double publication | réponse perdue (réseau) après création | test « réseau coupé » | message « may have been published: refresh » ; pas de renvoi automatique | — |
-| API de `ui.rs` changée par les relectures de #3-#5 | corrections en cours | relecture de cette ADR avant acceptation | points marqués « à confirmer » | amender l'ADR avant la vague 0 |
+| Éditeur qui rend la main sans attendre (Notepad à onglets, `code` sans `--wait`) | Windows 11, fenêtre Notepad déjà ouverte | test `ReturnedAtOnce` au harnais ; essai réel avec une fenêtre Notepad ouverte | notice `The editor returned at once…` ; `code.cmd --wait` documenté | si l'essai le confirme pour notepad : plus de défaut sous Windows (`VISUAL` / `EDITOR` requis, message `NotFound` adapté), décision à noter ici |
+| Test de `POST` instable contre `scripted_server` | corps non lu avant la réponse (RST) | 20 passages de `cargo test -p gh-client` par dev[client] | lire `Content-Length` octets avant de répondre | tests de succès des `POST` reportés au bout-en-bout de `qa` |
+| Écart entre les fixtures du client et les routes du faux | vague 1 en parallèle | bout-en-bout `qa` après fusion (`fake_roundtrip.rs`) | même source (exemples OpenAPI) des deux côtés | corriger le faux ou le client avant la vague 2 |
 | Faux serveur trop différent de GitHub (messages 422, règles) | doc incomplète | essai réel de l'utilisateur | `ghu` ne lit pas les messages 422 | corriger le faux |
 | Démo modifiée qui casse des tests existants | ajout de PRs à `alice/notes` | `cargo test --workspace` de dev[fake] | PRs nouvelles dans d'autres repos | — |
 | Conflits entre lots parallèles de `ghu` | `cargo fmt` ou fichier hors périmètre | `git diff --stat` par lot avant fusion | `rustfmt` sur ses fichiers ; listes de fichiers ci-dessus | rejouer le lot |
@@ -802,6 +915,11 @@ dev[fake] (corps) ; `docs/` → session principale et architecte.
 - Libellés exacts des 422 de GitHub pour une Review (Own PR, pending, PR fermée) : sans effet sur `ghu` (non lus),
   utiles à la fidélité du faux.
 - Comptage de `MAX_BODY_CHARS` par GitHub (caractères ou unités UTF-16) : au pire un 422 au lieu du refus local.
-- notepad et le fichier temporaire sous Windows (fichier fermé avant le lancement : `TempPath`), et éditeurs qui
-  forkent (`code` sans `--wait`) : texte inchangé, à documenter.
+- notepad et le fichier temporaire sous Windows (fichier fermé avant le lancement : `TempPath`) ; Notepad à
+  onglets de Windows 11 qui rend la main tout de suite quand une fenêtre est déjà ouverte (supposé, à l'essai
+  réel : la notice `ReturnedAtOnce` doit apparaître) ; éditeurs qui forkent (`code` sans `--wait`) : même notice.
+- `EDITOR="code.cmd --wait"` sous Windows : trouvé et attendu par `Command::new` (extension explicite), à l'essai
+  réel ; `code --wait` y donne `NotFound` (documenté).
+- Seuil de `RETURNED_AT_ONCE` (1 s) : assez haut pour le lancement d'un Notepad déjà ouvert, assez bas pour ne pas
+  gêner un `:q` rapide dans vim (qui ne verrait que la notice, texte inchangé de toute façon).
 - Comportement de GitHub pour une Review sur une PR fermée ou fusionnée (le faux répond 422).

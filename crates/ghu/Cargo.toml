@@ -12,6 +12,8 @@ clap = { workspace = true }
 dirs = { workspace = true }
 gh-client = { workspace = true }
 ratatui = { workspace = true }
+# Temporary file of the external editor (ADR 0003 § 5).
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -20,12 +22,18 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 gh-fake = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [[bin]]
 name = "ghu"
 path = "src/main.rs"
+
+# Test double of the user's editor (ADR 0003 § 5): found by tests through CARGO_BIN_EXE_ghu-fake-editor. Never shipped.
+[[bin]]
+name = "ghu-fake-editor"
+path = "src/bin/fake_editor.rs"
+test = false
+doc = false
 
 [lints]
 workspace = true

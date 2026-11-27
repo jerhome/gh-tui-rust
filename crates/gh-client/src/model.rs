@@ -236,7 +236,8 @@ pub enum PullFilter {
 
 /// A pull request as listed by GitHub (glossary: Pull request).
 ///
-/// `#[non_exhaustive]`: the detail screen (#6) adds fields (branches, body…); only this crate builds it.
+/// List rows only: the detail screen reads [`PullDetail`] instead (ADR 0003). `#[non_exhaustive]`: only this crate
+/// builds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PullRequest {
@@ -250,6 +251,259 @@ pub struct PullRequest {
     pub state: PrState,
     /// Last update (`updated_at`).
     pub updated_at: Timestamp,
+}
+
+/// The signed-in user (`GET /user`). Used to tell an Own PR (glossary: Own PR).
+///
+/// `#[non_exhaustive]`: only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct User {
+    /// Login, as GitHub writes it (compare ASCII case-insensitively).
+    pub login: String,
+}
+
+/// A commit id: 40 (SHA-1) or 64 (SHA-256) lowercase hexadecimal digits.
+///
+/// Invariant checked by [`CommitSha::parse`]; the only way to build one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CommitSha(String);
+
+impl CommitSha {
+    /// `None` for anything else (uppercase, other length, non-hex, surrounding spaces). Pure, never panics.
+    pub fn parse(text: &str) -> Option<Self> {
+        let _ = text;
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// The full id, as GitHub sent it.
+    pub fn as_str(&self) -> &str {
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// The first 7 characters, for display.
+    pub fn short(&self) -> &str {
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+}
+
+/// GitHub's mergeability of an open PR (field `mergeable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mergeable {
+    /// `true`: can be merged.
+    Yes,
+    /// `false`: conflicts with the base branch.
+    Conflicts,
+    /// `null`: GitHub is still computing it (a refresh may tell).
+    Unknown,
+}
+
+/// One PR with everything the detail screen shows (`GET /repos/{owner}/{repo}/pulls/{number}`, #6).
+///
+/// Distinct from [`PullRequest`] (list rows). `#[non_exhaustive]`: only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullDetail {
+    /// Number within the repo.
+    pub number: PrNumber,
+    /// Title, as GitHub sends it (may be empty).
+    pub title: String,
+    /// `user.login`; `ghost` when `user` is null.
+    pub author: String,
+    /// Same mapping as [`PullRequest::state`].
+    pub state: PrState,
+    /// Markdown description; `None` when null or empty.
+    pub body: Option<String>,
+    /// `head.label` (`owner:branch`): the source branch, fork owner included.
+    pub head_label: String,
+    /// `base.ref`: the target branch.
+    pub base_ref: String,
+    /// `head.sha`: the commit a Review is given on ([`crate::Client::post_review`]). An invalid one is an
+    /// [`Error::UnexpectedResponse`].
+    pub head_sha: CommitSha,
+    /// `base.repo.archived`, read at each load (a repo archived during the session is seen after a reload).
+    /// `false` when `base.repo` is null or `archived` is absent (GitHub then refuses with 403, which has its
+    /// message).
+    pub archived: bool,
+    /// `mergeable`.
+    pub mergeable: Mergeable,
+    /// `created_at`.
+    pub created_at: Timestamp,
+    /// `updated_at`.
+    pub updated_at: Timestamp,
+    /// Lines added (`additions`, 0 when absent).
+    pub additions: u64,
+    /// Lines deleted (`deletions`, 0 when absent).
+    pub deletions: u64,
+    /// Files changed (`changed_files`, 0 when absent).
+    pub changed_files: u64,
+}
+
+/// The state of a submitted review. `PENDING` reviews never reach the caller (glossary: Pending review,
+/// ignored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReviewState {
+    /// `APPROVED`.
+    Approved,
+    /// `CHANGES_REQUESTED`.
+    ChangesRequested,
+    /// `COMMENTED`: a review without verdict (body and/or line comments).
+    Commented,
+    /// `DISMISSED`: a verdict later dismissed by a maintainer.
+    Dismissed,
+}
+
+/// A submitted review (`GET` and `POST /repos/{owner}/{repo}/pulls/{number}/reviews`).
+///
+/// `#[non_exhaustive]`: only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Review {
+    /// GitHub's id.
+    pub id: u64,
+    /// `user.login`; `ghost` when `user` is null.
+    pub author: String,
+    /// Never pending.
+    pub state: ReviewState,
+    /// `None` when null or empty.
+    pub body: Option<String>,
+    /// `submitted_at`; `None` when GitHub omits it.
+    pub submitted_at: Option<Timestamp>,
+}
+
+/// A Comment of the PR conversation (an issue comment, `/repos/{owner}/{repo}/issues/{number}/comments`).
+///
+/// `#[non_exhaustive]`: only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Comment {
+    /// GitHub's id (increasing with time).
+    pub id: u64,
+    /// `user.login`; `ghost` when `user` is null.
+    pub author: String,
+    /// Markdown; empty string when absent.
+    pub body: String,
+    /// `created_at`.
+    pub created_at: Timestamp,
+}
+
+/// `status` of a changed file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FileStatus {
+    /// `added`.
+    Added,
+    /// `removed`.
+    Removed,
+    /// `modified`.
+    Modified,
+    /// `renamed` (see [`FileChange::previous_path`]).
+    Renamed,
+    /// `copied`.
+    Copied,
+    /// `changed` (mode or type change).
+    Changed,
+    /// `unchanged`.
+    Unchanged,
+}
+
+/// One changed file of a PR (`GET /repos/{owner}/{repo}/pulls/{number}/files`, #7).
+///
+/// `#[non_exhaustive]`: only this crate builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FileChange {
+    /// `filename`: path in the head commit.
+    pub path: String,
+    /// `previous_filename`, for [`FileStatus::Renamed`] (and [`FileStatus::Copied`]).
+    pub previous_path: Option<String>,
+    /// `status`; an unknown value is an [`Error::UnexpectedResponse`].
+    pub status: FileStatus,
+    /// Lines added.
+    pub additions: u64,
+    /// Lines deleted.
+    pub deletions: u64,
+    /// Unified diff hunks (no file header), line ends as GitHub sent them. `None` when GitHub sends none or an
+    /// empty one: binary file, diff too large, or rename without change.
+    pub patch: Option<String>,
+}
+
+/// The decision a review carries (glossary: Verdict).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    /// `APPROVE`.
+    Approve,
+    /// `REQUEST_CHANGES`.
+    RequestChanges,
+}
+
+/// Most characters (Unicode scalar values) GitHub accepts in a Comment or Review body.
+pub const MAX_BODY_CHARS: usize = 65_536;
+
+/// Text to publish: not blank, at most [`MAX_BODY_CHARS`] characters (Unicode scalar values). Sent as is, never
+/// trimmed nor completed.
+///
+/// `Debug` shows the length only: the text may be private and must not reach logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageBody(String);
+
+impl MessageBody {
+    /// Checks and keeps `text`.
+    ///
+    /// Errors: [`Error::InvalidBody`] with [`BodyProblem::Blank`] when `text.trim()` is empty, with
+    /// [`BodyProblem::TooLong`] (its character count) above [`MAX_BODY_CHARS`]. Never panics.
+    pub fn new(text: &str) -> Result<Self, Error> {
+        let _ = text;
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// The text, as given to [`MessageBody::new`].
+    pub fn as_str(&self) -> &str {
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+}
+
+impl fmt::Debug for MessageBody {
+    /// `MessageBody { chars: <n> }`: never the text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageBody")
+            .field("chars", &self.0.chars().count())
+            .finish()
+    }
+}
+
+/// Why a text cannot be published ([`Error::InvalidBody`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyProblem {
+    /// Empty or only whitespace.
+    Blank,
+    /// More than [`MAX_BODY_CHARS`] characters.
+    TooLong {
+        /// The character count of the refused text.
+        chars: usize,
+    },
+}
+
+/// A Review to publish ([`crate::Client::post_review`]). A Request changes without text cannot be built
+/// (glossary: Review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewRequest {
+    /// `APPROVE`, with an optional text (`body` omitted from the request when `None`).
+    Approve {
+        /// The review text, if any.
+        body: Option<MessageBody>,
+    },
+    /// `REQUEST_CHANGES`, whose text is mandatory.
+    RequestChanges {
+        /// The review text.
+        body: MessageBody,
+    },
+}
+
+impl ReviewRequest {
+    /// The Verdict this request carries.
+    pub fn verdict(&self) -> Verdict {
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
 }
 
 #[cfg(test)]

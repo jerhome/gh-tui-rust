@@ -11,12 +11,21 @@
 //! - `list.rs`: what the list screens share ([`list::Content`], [`list::Selection`]).
 //! - `repo_list.rs`: the Repo list screen (#2, #3, #4), root of the stack.
 //! - `pulls.rs`: the PR list of one repo (#5).
+//! - ADR 0003 (#6-#10): `pr_detail.rs` (detail of one PR), `diff.rs` (its changed files), `compose.rs` (writing,
+//!   confirming and publishing a Comment or a Review), `text_area.rs` (multi-line text field), `text.rs` (network
+//!   text made safe to draw, simple Markdown). A screen closes itself with [`Shared::pop`] and gives a [`Signal`]
+//!   to the screen below; a text field asks for the external editor with [`Shared::request_edit`].
 
+mod compose;
+mod diff;
 mod keys;
 mod list;
+mod pr_detail;
 mod pulls;
 mod render;
 mod repo_list;
+mod text;
+mod text_area;
 
 use gh_client::{PullRequest, Repo};
 use ratatui::Frame;
@@ -25,6 +34,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
+use crate::editor::{EditRequest, EditorError, EditorVars};
 use crate::{Context, KeyEvent};
 
 pub(crate) use keys::HelpRow;
@@ -83,8 +93,45 @@ pub(crate) enum Outcome {
     Repo(gh_client::Result<Repo>),
     /// [`gh_client::Client::pulls`].
     Pulls(gh_client::Result<Vec<PullRequest>>),
+    /// The four requests of the PR detail (`pull`, `reviews`, `comments`, `current_user`), joined with
+    /// `tokio::try_join!`: the first error wins (#6).
+    #[allow(
+        dead_code,
+        reason = "ADR 0003: constructed from wave 2 (dev[tui-detail])"
+    )]
+    /// Boxed: a `PrPage` is several times larger than the other variants (clippy `large_enum_variant`).
+    PrPage(gh_client::Result<Box<pr_detail::PrPage>>),
+    /// [`gh_client::Client::pull_files`] (#7).
+    #[allow(
+        dead_code,
+        reason = "ADR 0003: constructed from wave 3 (dev[tui-diff])"
+    )]
+    Files(gh_client::Result<Vec<gh_client::FileChange>>),
+    /// [`gh_client::Client::post_comment`] (#8).
+    #[allow(
+        dead_code,
+        reason = "ADR 0003: constructed from wave 3 (dev[tui-compose])"
+    )]
+    CommentPosted(gh_client::Result<gh_client::Comment>),
+    /// [`gh_client::Client::post_review`] (#10).
+    #[allow(
+        dead_code,
+        reason = "ADR 0003: constructed from wave 4 (dev[tui-review])"
+    )]
+    ReviewPosted(gh_client::Result<gh_client::Review>),
     /// The task panicked or was cancelled; show [`TASK_FAILED`].
     TaskFailed,
+}
+
+/// News given to the screen that becomes the top one when the screen above closes itself ([`Shared::pop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Signal {
+    /// A Comment or Review was published on the PR shown below: reload it.
+    #[allow(
+        dead_code,
+        reason = "ADR 0003: constructed from wave 3 (dev[tui-compose])"
+    )]
+    Published,
 }
 
 /// Message for [`Outcome::TaskFailed`].
@@ -107,8 +154,15 @@ pub(crate) struct Shared {
     in_flight: usize,
     next_id: u64,
     pub(crate) notice: Option<Notice>,
-    /// Screens asked for by [`Shared::push`], put on the stack by [`App`] once the current call returns.
+    /// Screens asked for by [`Shared::push`] (and a [`Flow::Push`]), put on the stack by [`App`] once the current
+    /// call returns.
     pushed: Vec<Box<dyn View>>,
+    /// Set by [`Shared::pop`]: `Some(signal)` asks to close the calling screen; dealt with by [`App`] after the call.
+    popped: Option<Option<Signal>>,
+    /// `VISUAL` / `EDITOR` as captured by `prepare` (raw, parsed by `EditRequest::run`).
+    editor: EditorVars,
+    /// The text of the pending editor request ([`Shared::request_edit`]), taken by [`Ui::take_edit`].
+    edit: Option<String>,
 }
 
 impl Shared {
@@ -155,6 +209,25 @@ impl Shared {
     pub(crate) fn is_busy(&self) -> bool {
         self.in_flight > 0
     }
+
+    /// Asks to close the calling screen once the current call (key, apply or edited) returns, then gives `signal`
+    /// to the screen below, which becomes the top ([`View::signal`]). Ignored on the root (no signal either).
+    ///
+    /// Only the top screen may call it: a request made by a lower screen during `apply` is a bug (`debug_assert`
+    /// in [`App`]; ignored with a `tracing::warn` in release). A call that asks to pop returns [`Flow::Handled`]
+    /// (key) and calls neither [`Flow::Push`] nor [`Shared::push`]: `debug_assert` in [`App`]; in release the pop
+    /// wins and the screens asked for are dropped (`tracing::warn`). The last call in one screen call wins.
+    #[allow(dead_code, reason = "ADR 0003: called from wave 3 (dev[tui-compose])")]
+    pub(crate) fn pop(&mut self, signal: Option<Signal>) {
+        self.popped = Some(signal);
+    }
+
+    /// Asks the loop to open the user's editor on `text` (#9). The latest request wins. The answer comes back
+    /// through [`View::edited`] on the top screen ([`Ui::take_edit`], [`Ui::finish_edit`]). Never blocks.
+    #[allow(dead_code, reason = "ADR 0003: called from wave 4 (dev[tui-editor])")]
+    pub(crate) fn request_edit(&mut self, text: String) {
+        self.edit = Some(text);
+    }
 }
 
 /// What a screen asks the application to do after a key.
@@ -200,6 +273,19 @@ pub(crate) trait View {
 
     /// Draws the screen's body in `area` (between header and footer). May place the cursor for a text field.
     fn render(&self, frame: &mut Frame<'_>, area: Rect);
+
+    /// Receives a [`Signal`] after the screen above closed with [`Shared::pop`]. May call [`Shared::spawn`],
+    /// [`Shared::notify`] and [`Shared::push`]; a [`Shared::pop`] made here is a bug (`debug_assert`, ignored in
+    /// release). Default: ignored.
+    fn signal(&mut self, signal: Signal, shared: &mut Shared) {
+        let _ = (signal, shared);
+    }
+
+    /// The result of the editor asked for with [`Shared::request_edit`]: the new text, or why it failed. Called
+    /// on the top screen only. Default: ignored.
+    fn edited(&mut self, result: Result<String, EditorError>, shared: &mut Shared) {
+        let _ = (result, shared);
+    }
 }
 
 impl<B: Backend> Ui<B> {
@@ -214,6 +300,9 @@ impl<B: Backend> Ui<B> {
             next_id: 0,
             notice: None,
             pushed: Vec::new(),
+            popped: None,
+            editor: ctx.editor,
+            edit: None,
         };
         let root = repo_list::RepoListScreen::new(&mut shared, ctx.pins, ctx.pins_problem);
         let app = App {
@@ -281,6 +370,30 @@ impl<B: Backend> Ui<B> {
     pub fn is_busy(&self) -> bool {
         self.app.shared.is_busy()
     }
+
+    /// The pending editor request, if a screen asked for one since the last call (`Shared::request_edit`).
+    /// The caller suspends the terminal, runs [`EditRequest::run`] off the async loop (`spawn_blocking`; the test
+    /// harness may call it directly), resumes the terminal, then calls [`Ui::finish_edit`]. Never blocks.
+    pub fn take_edit(&mut self) -> Option<EditRequest> {
+        let text = self.app.shared.edit.take()?;
+        Some(EditRequest::new(self.app.shared.editor.clone(), text))
+    }
+
+    /// Gives the editor's result to the top screen ([`View::edited`]), then applies what that screen asked
+    /// (pop, push). Ignored once [`Ui::is_finished`].
+    pub fn finish_edit(&mut self, result: Result<String, EditorError>) {
+        if self.app.finished {
+            return;
+        }
+        self.app.edited(result);
+    }
+
+    /// Clears the terminal so the next draw repaints every cell (after the editor used the screen).
+    ///
+    /// Errors: the backend's error.
+    pub fn clear(&mut self) -> Result<(), B::Error> {
+        self.terminal.clear()
+    }
 }
 
 impl App {
@@ -314,7 +427,8 @@ impl App {
         let flow = top.key(key, &mut self.shared);
         match flow {
             Flow::Handled => {}
-            Flow::Push(view) => self.stack.push(view),
+            // Before the screens of `Shared::push`, so they go on top of it.
+            Flow::Push(view) => self.shared.pushed.insert(0, view),
             Flow::Ignored if editing => {}
             Flow::Ignored => match keys::lookup(&keys::GLOBAL, key) {
                 Some(keys::Global::Quit) => self.finished = true,
@@ -323,8 +437,45 @@ impl App {
                 None => {}
             },
         }
-        // After the flow, so a screen pushed by `Shared::push` goes on top of one returned as `Flow::Push`.
+        self.settle();
+    }
+
+    /// After a call on the top screen (key, apply, edited): honours its [`Shared::pop`] request, then stacks the
+    /// screens asked for by [`Flow::Push`] and [`Shared::push`], in order. (`apply` drops beforehand a pop asked by a
+    /// lower screen.)
+    fn settle(&mut self) {
+        if let Some(signal) = self.shared.popped.take() {
+            debug_assert!(
+                self.shared.pushed.is_empty(),
+                "Shared::pop and a pushed screen in the same call"
+            );
+            if !self.shared.pushed.is_empty() {
+                tracing::warn!("screens pushed along with Shared::pop dropped");
+                self.shared.pushed.clear();
+            }
+            if self.stack.len() > 1 {
+                self.pop();
+                if let Some(signal) = signal {
+                    let top = self.stack.last_mut().expect("the stack is never empty");
+                    top.signal(signal, &mut self.shared);
+                    debug_assert!(
+                        self.shared.popped.is_none(),
+                        "Shared::pop called during View::signal"
+                    );
+                    if self.shared.popped.take().is_some() {
+                        tracing::warn!("Shared::pop during View::signal ignored");
+                    }
+                }
+            }
+        }
         self.stack.append(&mut self.shared.pushed);
+    }
+
+    /// Gives the editor's result to the top screen, then settles.
+    fn edited(&mut self, result: Result<String, EditorError>) {
+        let top = self.stack.last_mut().expect("the stack is never empty");
+        top.edited(result, &mut self.shared);
+        self.settle();
     }
 
     /// Goes back one screen; does nothing on the root.
@@ -348,12 +499,22 @@ impl App {
     fn apply(&mut self, id: RequestId, outcome: Outcome) {
         self.shared.in_flight = self.shared.in_flight.saturating_sub(1);
         let mut outcome = Some(outcome);
-        for view in self.stack.iter_mut().rev() {
-            match view.apply(
+        let top = self.stack.len() - 1;
+        // A pop asked by the top screen is honoured; one asked by a screen below is a bug, dropped.
+        let mut top_pop = None;
+        let mut lower_pop = false;
+        for (index, view) in self.stack.iter_mut().enumerate().rev() {
+            let answer = view.apply(
                 id,
                 outcome.take().expect("set until claimed"),
                 &mut self.shared,
-            ) {
+            );
+            if index == top {
+                top_pop = self.shared.popped.take();
+            } else if self.shared.popped.take().is_some() {
+                lower_pop = true;
+            }
+            match answer {
                 None => break,
                 Some(unclaimed) => outcome = Some(unclaimed),
             }
@@ -361,7 +522,12 @@ impl App {
         if outcome.is_some() {
             tracing::debug!(?id, "stale background result dropped");
         }
-        self.stack.append(&mut self.shared.pushed);
+        debug_assert!(!lower_pop, "Shared::pop called by a screen below the top");
+        if lower_pop {
+            tracing::warn!("Shared::pop from a screen below the top ignored");
+        }
+        self.shared.popped = top_pop;
+        self.settle();
     }
 }
 
@@ -433,15 +599,51 @@ mod tests {
         fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
     }
 
-    #[tokio::test]
-    async fn a_screen_pushed_during_a_key_is_stacked_after_the_key() {
+    /// A screen that closes itself with [`Shared::pop`] on a key, and asks for the editor on `e`; records the
+    /// signals and editor results it receives.
+    #[derive(Default)]
+    struct Popper {
+        signals: std::rc::Rc<std::cell::RefCell<Vec<Signal>>>,
+        edited: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl View for Popper {
+        fn title(&self) -> String {
+            "popper".to_owned()
+        }
+        fn help(&self) -> Vec<HelpRow> {
+            Vec::new()
+        }
+        fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
+            if key.code == KeyCode::Char('e') {
+                shared.request_edit("draft".to_owned());
+            } else {
+                shared.pop(Some(Signal::Published));
+            }
+            Flow::Handled
+        }
+        fn apply(&mut self, _: RequestId, outcome: Outcome, _: &mut Shared) -> Option<Outcome> {
+            Some(outcome)
+        }
+        fn signal(&mut self, signal: Signal, _: &mut Shared) {
+            self.signals.borrow_mut().push(signal);
+        }
+        fn edited(&mut self, result: Result<String, EditorError>, _: &mut Shared) {
+            self.edited
+                .borrow_mut()
+                .push(result.unwrap_or_else(|error| error.to_string()));
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
+    }
+
+    fn app_with(stack: Vec<Box<dyn View>>) -> App {
         let (tx, rx) = mpsc::unbounded_channel();
         let client = gh_client::Client::new(
             gh_client::ApiBase::default(),
             gh_client::Token::new("unused").expect("token"),
         )
         .expect("client");
-        let mut app = App {
+        App {
             shared: Shared {
                 client,
                 tx,
@@ -449,15 +651,72 @@ mod tests {
                 next_id: 0,
                 notice: None,
                 pushed: Vec::new(),
+                popped: None,
+                editor: EditorVars::default(),
+                edit: None,
             },
             rx,
-            stack: vec![Box::new(Pusher)],
+            stack,
             help: false,
             finished: false,
             spinner: 0,
-        };
-        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        }
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[tokio::test]
+    async fn a_screen_pushed_during_a_key_is_stacked_after_the_key() {
+        let mut app = app_with(vec![Box::new(Pusher)]);
+        press(&mut app, 'x');
         assert_eq!(app.stack.len(), 2);
         assert!(app.shared.pushed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_screen_that_pops_itself_gives_the_signal_to_the_screen_below() {
+        let below = Popper::default();
+        let signals = std::rc::Rc::clone(&below.signals);
+        let mut app = app_with(vec![
+            Box::new(Pusher),
+            Box::new(below),
+            Box::new(Popper::default()),
+        ]);
+        press(&mut app, 'x');
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.top().title(), "popper");
+        assert_eq!(*signals.borrow(), vec![Signal::Published]);
+        assert!(app.shared.popped.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pop_on_the_root_is_ignored_without_signal() {
+        let root = Popper::default();
+        let signals = std::rc::Rc::clone(&root.signals);
+        let mut app = app_with(vec![Box::new(root)]);
+        press(&mut app, 'x');
+        assert_eq!(app.stack.len(), 1);
+        assert!(signals.borrow().is_empty());
+        assert!(app.shared.popped.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_edit_request_is_taken_once_and_its_result_reaches_the_top_screen() {
+        let top = Popper::default();
+        let edited = std::rc::Rc::clone(&top.edited);
+        let mut app = app_with(vec![Box::new(Pusher), Box::new(top)]);
+        press(&mut app, 'e');
+        assert_eq!(app.shared.edit.as_deref(), Some("draft"));
+        assert_eq!(app.shared.edit.take().as_deref(), Some("draft"));
+        assert!(app.shared.edit.is_none());
+        app.edited(Ok("new text".to_owned()));
+        app.edited(Err(EditorError::TooLarge));
+        assert_eq!(
+            *edited.borrow(),
+            vec!["new text".to_owned(), "edited text too large".to_owned()]
+        );
+        assert_eq!(app.stack.len(), 2);
     }
 }

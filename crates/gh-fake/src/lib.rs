@@ -23,6 +23,11 @@
 //!     [`State::pulls`] filtered by `state` (`open` default, `closed` = closed and merged, `all`; anything else:
 //!     422 `Validation Failed`), sorted by `sort` (`created` default, `updated`) and `direction` (`desc`
 //!     default, `asc`), ties broken by `number` descending.
+//!   - ADR 0003 (#6-#10), detail in its § 2: `GET /user`; `GET /repos/{owner}/{repo}/pulls/{number}`, its
+//!     `/files` and `/reviews` lists, `GET /repos/{owner}/{repo}/issues/{number}/comments` (404 when the PR is
+//!     missing); `POST /repos/{owner}/{repo}/issues/{number}/comments` (201) and
+//!     `POST /repos/{owner}/{repo}/pulls/{number}/reviews` (200), which add to the [`Pull`] using
+//!     [`State::now`] and [`State::next_id`], answer 403 on an archived repo and 422 on what GitHub refuses.
 //!   - Every list route paginates the same way: `per_page` (default 30, capped by [`State::max_per_page`]),
 //!     `page` (default 1), and a `Link` header with `next` and `last` (absolute URLs on the fake's address,
 //!     keeping the other query parameters) while a next page exists.
@@ -38,7 +43,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 pub use state::{
-    Access, Failure, FailureResponse, Method, Pull, PullState, RecordedRequest, Repo, State, User,
+    Access, Failure, FailureResponse, FileStatus, IssueComment, Method, Pull, PullFile, PullReview,
+    PullState, RecordedRequest, Repo, ReviewState, State, User,
 };
 
 /// The token [`State::new`] and [`State::demo`] accept.

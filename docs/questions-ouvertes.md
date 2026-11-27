@@ -5,7 +5,9 @@ Une question répondue est déplacée en bas avec sa réponse et sa date.
 
 ## En attente
 
-Aucune.
+- Q2 (ADR 0003, § 5, 2026-11-27) — Éditeur par défaut sous Windows : si l'essai réel confirme que le Notepad à onglets
+  de Windows 11 rend la main tout de suite, faut-il le retirer (et exiger `VISUAL` ou `EDITOR`) ?
+  Recommandation et défaut appliqué : garder notepad avec la notice `ReturnedAtOnce`, trancher après l'essai réel.
 
 ## Répondues
 

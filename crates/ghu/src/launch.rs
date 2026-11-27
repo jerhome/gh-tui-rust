@@ -7,6 +7,7 @@ use clap::Parser;
 
 use gh_client::{ApiBase, Token};
 
+use crate::editor::EditorVars;
 use crate::pins::{PinStore, PinsError};
 use crate::{API_URL_VAR, Environment};
 
@@ -37,13 +38,15 @@ pub enum Launch {
 /// Everything the TUI needs, resolved at start-up. Opaque: only [`prepare`] builds it.
 ///
 /// Owns the GitHub client (base URL + token) and the Pinned repos store. `Send`, moved into [`crate::run`] or
-/// [`crate::Ui::new`]. Its `Debug` never shows the token. Later tickets add fields (editor command, #9).
+/// [`crate::Ui::new`]. Its `Debug` never shows the token (nor the editor variables).
 pub struct Context {
     pub(crate) client: gh_client::Client,
     /// Loaded by [`prepare`] from [`Environment::config_dir`] (ADR 0002).
     pub(crate) pins: PinStore,
     /// Why the Pinned repos file could not be read, shown by the Repo list as its first notice.
     pub(crate) pins_problem: Option<PinsError>,
+    /// `VISUAL` and `EDITOR` as read by [`prepare`] (raw; unset or absent: `None`), for the external editor (#9).
+    pub(crate) editor: EditorVars,
 }
 
 impl std::fmt::Debug for Context {
@@ -66,6 +69,8 @@ impl std::fmt::Debug for Context {
 ///   variable and the reason, then [`Launch::Exit(1)`].
 /// - Pinned repos: loaded with `PinStore::load(env.config_dir())` (never ends the program: a bad file is reported in
 ///   the TUI and pinning is disabled for the session). Only once the token and URL are valid.
+/// - Editor (#9): `VISUAL` and `EDITOR` read with [`Environment::var`] and kept raw (parsed only when an edit runs,
+///   so a bad value never ends the program).
 /// - The token never appears in `out`, `err` or logs. No network access here (a refused token shows in the TUI).
 ///
 /// Write errors on `out`/`err` are ignored. Blocking (may run `gh`); call before starting the TUI.
@@ -123,6 +128,10 @@ where
                 client,
                 pins,
                 pins_problem,
+                editor: EditorVars {
+                    visual: env.var("VISUAL"),
+                    editor: env.var("EDITOR"),
+                },
             })
         }
         Err(error) => {

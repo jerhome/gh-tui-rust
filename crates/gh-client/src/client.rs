@@ -11,7 +11,10 @@ use url::Url;
 use crate::link::next_link;
 use crate::status::{classify, redact};
 use crate::wire::{decode_pulls, decode_repo, decode_repos};
-use crate::{Affiliation, ApiBase, Error, PullFilter, PullRequest, Repo, RepoName, Result, Token};
+use crate::{
+    Affiliation, ApiBase, Comment, CommitSha, Error, FileChange, MessageBody, PrNumber, PullDetail,
+    PullFilter, PullRequest, Repo, RepoName, Result, Review, ReviewRequest, Token, User,
+};
 
 /// Largest body read from one answer: a page of 100 repos is far below it; the limit only bounds memory.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -163,6 +166,86 @@ impl Client {
         let secret = self.token.expose();
         self.paginate(url, |body| decode_pulls(body, secret), |pull| pull.number)
             .await
+    }
+
+    /// `GET /user`: the signed-in user, to tell an Own PR (#6).
+    ///
+    /// Errors: [`crate::Error::Unauthorized`], [`crate::Error::RateLimited`], [`crate::Error::Forbidden`],
+    /// [`crate::Error::Network`], [`crate::Error::UnexpectedResponse`], [`crate::Error::Api`].
+    pub async fn current_user(&self) -> Result<User> {
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `GET /repos/{owner}/{repo}/pulls/{number}`: one PR with its detail fields (#6).
+    ///
+    /// Errors: as [`Client::pulls`]; [`crate::Error::NotFound`] for a missing PR or repo;
+    /// [`crate::Error::UnexpectedResponse`] also for an invalid `head.sha`, number 0, a bad timestamp or an
+    /// unknown state.
+    pub async fn pull(&self, repo: &RepoName, number: PrNumber) -> Result<PullDetail> {
+        let _ = (repo, number);
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `GET /repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100`, every page, chronological order; `PENDING`
+    /// entries are dropped; a page entry seen twice (same `id`) is kept once.
+    ///
+    /// Errors: as [`Client::pull`]; an unknown `state` is [`crate::Error::UnexpectedResponse`].
+    pub async fn reviews(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<Review>> {
+        let _ = (repo, number);
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `GET /repos/{owner}/{repo}/issues/{number}/comments?per_page=100`: the conversation Comments of the PR,
+    /// every page, oldest first (deduplicated by `id`).
+    ///
+    /// Errors: as [`Client::pull`].
+    pub async fn comments(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<Comment>> {
+        let _ = (repo, number);
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `GET /repos/{owner}/{repo}/pulls/{number}/files?per_page=100`, every page, GitHub's order (deduplicated by
+    /// `filename`) (#7).
+    ///
+    /// Errors: as [`Client::pull`]; an unknown `status` is [`crate::Error::UnexpectedResponse`].
+    pub async fn pull_files(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<FileChange>> {
+        let _ = (repo, number);
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `POST /repos/{owner}/{repo}/issues/{number}/comments` with `{"body": body}` (#8). Expects 201 and returns
+    /// the created Comment. Never retried.
+    ///
+    /// Errors: as [`Client::pull`], plus [`crate::Error::Forbidden`] (no rights, archived repo: 403) and
+    /// [`crate::Error::Unprocessable`] (422). A [`crate::Error::Network`] error does not tell whether GitHub
+    /// created the Comment. Another 2xx status is [`crate::Error::UnexpectedResponse`].
+    pub async fn post_comment(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        body: &MessageBody,
+    ) -> Result<Comment> {
+        let _ = (repo, number, body);
+        todo!("ADR 0003, wave 1: dev[client]")
+    }
+
+    /// `POST /repos/{owner}/{repo}/pulls/{number}/reviews` with
+    /// `{"event": "APPROVE" | "REQUEST_CHANGES", "body": … (omitted when None), "commit_id": commit}` (#10).
+    /// Expects 200 and a non-`PENDING` state (else [`crate::Error::UnexpectedResponse`]). Never retried.
+    ///
+    /// `commit` is the `head.sha` the user saw ([`PullDetail::head_sha`]).
+    ///
+    /// Errors: as [`Client::post_comment`]; [`crate::Error::Unprocessable`] for a review GitHub refuses (own PR,
+    /// pending review of this user, closed PR, commit not in the PR…).
+    pub async fn post_review(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        commit: &CommitSha,
+        review: &ReviewRequest,
+    ) -> Result<Review> {
+        let _ = (repo, number, commit, review);
+        todo!("ADR 0003, wave 1: dev[client]")
     }
 
     /// Reads a list route page after page, following `next` links, and keeps the first of the items that share a

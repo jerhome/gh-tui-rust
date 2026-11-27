@@ -19,7 +19,7 @@ rebuilt between the two.
 
 ## Tested platforms
 
-- Linux (WSL) and Windows: full manual trial on the release-candidate assets.
+- Linux (WSL) and Windows: full manual trial on the release-candidate assets before the final release.
 - macOS (Apple Silicon): **built by CI but never tried by hand.** Tests run in CI on macOS; expect rough edges.
 
 ## Known limits of 0.1

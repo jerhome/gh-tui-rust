@@ -7,6 +7,9 @@ status: accepted
 Statut : **acceptée** (2026-11-27 11:45). Proposée le 2026-11-26 17:07, amendée le 2026-11-27 d'après la relecture
 `.claude/rv-adr-0003.md` (4 majeurs, 7 mineurs) ; seconde relecture OK avec trois mineurs (n1 mode `keep` du faux
 éditeur, n2 départ de la vague 2, n3 seuil `ReturnedAtOnce` réglable), corrigés à l'acceptation.
+**Amendée le 2026-11-27 (12:49)** d'après les relectures de #8 (Comment) : § 3 (`Signal::Kept`, `Draft`), § 4 (texte
+gardé après un échec, publication incertaine, touches de Confirm et de Publishing, titre `Files (<N>)` du Diff),
+lignes tui-compose et tui-review des Lots. Choix réversibles, internes à `ghu`.
 Les relectures de #3, #4 et #5 sont faites et commitées (3e7c5f9, cc81eb6) et l'ADR 0002 est acceptée : les
 anciens points « à confirmer après #3-#5 » sont tranchés d'après le code de `main` (fefff13) et remplacés ci-dessous
 par la décision confirmée.
@@ -379,10 +382,23 @@ pub(crate) enum Outcome {
 }
 
 /// News given to the screen that becomes the top one when the screen above closes itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not Copy since the amendment of #8: Kept owns the user's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Signal {
     /// A Comment or Review was published on the PR shown below: reload it.
     Published,
+    /// The compose screen closed while the message of a failed publication was shown: the PR detail keeps
+    /// the text and gives it back to the next compose screen of the same Kind. Nothing is reloaded.
+    Kept(Draft),
+}
+
+/// Owned by the PR detail until reopened with the same Kind (moved into the compose screen) or the detail is
+/// closed (dropped; never on disk). Debug shows the kind and the length only.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Draft {
+    pub(crate) kind: compose::Kind,
+    /// Never blank.
+    pub(crate) text: String,
 }
 
 impl Shared {
@@ -534,7 +550,8 @@ ligne d'en-tête (`<chemin>`, ou `<ancien> → <nouveau>`), puis le patch (déco
 `Renamed from <ancien>, no content change.` (renommé, `+0 -0`) ou `No diff from GitHub: binary file, or too large
 to show.` Liste vide : `No changed files.` Touches :
 `n` fichier suivant, `p` précédent (bornés ; défilement remis à zéro), `Up/k` `Down/j`, `PgUp` `PgDn`,
-`Left/h` `Right/l` (8 colonnes), `r` recharger. Erreur : `Cannot load the changed files: <raison>`.
+`Left/h` `Right/l` (8 colonnes), `r` recharger. Erreur : `Cannot load the changed files: <raison>`. La liste
+porte le titre de cadre `Files (<N>)`, `N` = nombre de fichiers chargés (ajout de #7, accepté à sa relecture).
 
 ```rust
 // ui/text_area.rs (#8, Ctrl-E by #9)
@@ -578,7 +595,9 @@ pub(crate) enum Kind { Comment, Review(gh_client::Verdict) }
 pub(crate) struct ComposeScreen { /* target, kind, text: TextArea, phase: Writing | Confirm | Publishing, error */ }
 impl ComposeScreen {
     /// Opened by `c`, `a` or `x` on the detail, only when actions() allows it. No request at opening.
-    pub(crate) fn new(target: Target, kind: Kind) -> Self;
+    /// `draft`: the text kept for this Kind (Signal::Kept), put in the field with the cursor at the end; None:
+    /// empty field. (Amendment of #8: the detail takes it with PrDetailScreen::take_draft.)
+    pub(crate) fn new(target: Target, kind: Kind, draft: Option<String>) -> Self;
 }
 // View::edited forwards to TextArea::edited (written in wave 0).
 ```
@@ -591,24 +610,46 @@ impl ComposeScreen {
    `body`) ; refus en notice : `Write a text first.` (Comment blanc), `Request changes needs a text.`,
    `The text is too long: <n> characters (GitHub allows 65536).` ; sinon phase Confirm. `Esc` : texte blanc →
    écran fermé (`Shared::pop(None)`) ; sinon notice `Press Esc again to discard the text.` et un second `Esc`
-   immédiat ferme (toute autre touche annule l'armement).
+   immédiat ferme (toute autre touche annule l'armement). **Exception, après un échec** (message rouge d'une
+   publication affiché, voir plus bas) : un seul `Esc` ferme et **garde le texte** :
+   `Shared::pop(Some(Signal::Kept(Draft { kind, text })))` et notice `Text kept: open the comment again to get it
+   back.` (`… the review again …`) ; texte blanc : `Shared::pop(None)`. Le détail garde ce brouillon (le
+   dernier gagne) et le rend au prochain `c` (`a`, `x` pour une Review du même Verdict) ; un brouillon d'une
+   autre sorte reste en place ; le détail fermé, il est perdu. Rouvert avec un brouillon, l'écran repart sans
+   message : le double `Esc` y vaut de nouveau, et jette le texte.
 2. **Confirm** (`editing() = false`) : `Publish this Comment on <owner/name> #<n>?` ou `Publish this Review on
    <owner/name> #<n>?` + `Verdict: Approve` / `Verdict: Request changes`, puis `Text:` et le texte brut nettoyé
    (`(no text)` si vide ; au-delà de la hauteur : `… <k> more lines`), puis `y / Enter publish · n / Esc back to
-   the text`. `y` ou `Enter` : publication ; `n` ou `Esc` : retour à Writing, texte intact.
-3. **Publishing** : `Publishing…` ; `y`, `Enter`, `Esc` sans effet (notice `Publishing: wait for GitHub's
-   answer.` pour `Esc`) ; une seule requête en vol, jamais renvoyée seule.
+   the text`. `y` ou `Enter` : publication ; `n` ou `Esc` : retour à Writing, texte intact. Toute autre touche
+   est sans effet (`Flow::Handled`), `q` compris (le texte n'est pas perdu sans demander), sauf `?` (aide,
+   `Flow::Ignored`).
+3. **Publishing** : `Publishing…` ; toute touche est sans effet (`Flow::Handled`), sauf `?` (aide) ; `Esc` et
+   `q` donnent la notice `Publishing: wait for GitHub's answer.` ; une seule requête en vol, jamais renvoyée
+   seule. `Ctrl-C` quitte toujours (`App`, avant l'écran) : limite connue, la publication en vol peut aboutir
+   sans que l'utilisateur le sache ; de même `q` dans l'aide ouverte par `?`.
 
 Succès : `Shared::pop(Some(Signal::Published))` et notice `Comment published.` / `Review published: Approve.` /
 `Review published: Request changes.` ; le détail se recharge. Échec : retour à Writing, texte intact, message
 rouge au-dessus de la zone : `Cannot publish the comment: <raison>` / `Cannot publish the review: <raison>`
-(`error_message`), sauf trois cas propres à la publication : 422 d'une Review → `GitHub refused the review (422).
-If you started a review on the website (pending review), submit or delete it there; or the PR changed: refresh
-(Esc, r). Then try again.` (couvre aussi un force-push après le chargement, `commit_id` hors de la PR, et une PR
-fermée entre-temps) ; erreur réseau → `no answer from GitHub. It may have been published anyway: refresh the PR
-(Esc, r) before trying again.` ; `Outcome::TaskFailed` reçu pendant Publishing (tâche de publication paniquée) →
-traité comme l'erreur réseau : retour à Writing, texte intact, même message « may have been published ». Le texte
-publié n'est jamais construit ni complété par `ghu` : c'est celui de la zone, tel quel.
+(`error_message`), sauf deux cas propres à la publication :
+
+- **422 d'une Review** → `GitHub refused the review (422). If you started a review on the website (pending
+  review), submit or delete it there; or the PR changed: press Esc, then r to refresh; the text comes back when
+  you open the review again.` (couvre aussi un force-push après le chargement, `commit_id` hors de la PR, et une
+  PR fermée entre-temps) ;
+- **Publication incertaine** : GitHub a peut-être créé le Comment ou la Review. Cas : `Error::Network` ;
+  `Error::UnexpectedResponse` (statut 2xx autre que celui attendu, réponse trop grosse, JSON illisible : GitHub a
+  souvent déjà répondu 2xx, et la variante ne dit pas le statut) ; `Error::Api` de statut 500 à 599 (une
+  passerelle 502 / 503 / 504, ou un 500 après l'écriture) ; `Outcome::TaskFailed` reçu pendant Publishing (tâche
+  paniquée). Message (`<what>` = `comment` ou `review`) : `Cannot publish the <what>: no clear answer from
+  GitHub. It may have been published anyway: press Esc, then r to check the PR; the text comes back when you open
+  the <what> again.` La règle est une fonction pure de `compose.rs` (`fn uncertain(&gh_client::Error) -> bool`,
+  testée par variante), commune à Comment et Review.
+
+Le message rouge reste affiché pendant la saisie (frappe, collage, éditeur, refus de `Ctrl-S`) jusqu'à la
+prochaine publication (entrée en Publishing) ou la fermeture de l'écran : c'est lui qui donne le conseil, et sa
+présence décide du `Esc` qui garde le texte. Le texte publié n'est jamais construit ni complété par `ghu` : c'est
+celui de la zone, tel quel.
 
 ### 5. Éditeur externe (#9)
 
@@ -789,6 +830,19 @@ rien d'autre que son fichier.
   `tempfile` est déjà dans le `Cargo.lock`.
 - **Envoyer la Review sans `commit_id`** : GitHub prendrait le dernier commit, peut-être poussé après la lecture
   du diff ; on approuverait du code non vu.
+- **Brouillon dans `Shared`** (table par PR et sorte, vivant toute la session) : survivrait à la sortie du
+  détail, mais un champ de plus dans `Shared` casse chaque construction littérale de `Shared` (tests de
+  `text_area.rs`, `pr_detail.rs`, `ui.rs`) et demande une borne mémoire ; le détail est le seul lieu où le
+  conseil « Esc, r » ramène. `Signal::Kept` reste local. Reviendrait si l'on veut retrouver un texte après être
+  sorti du détail.
+- **Changer seulement le conseil** (« vérifiez sur le site ») : aucun moyen, dans `ghu`, de vérifier sans perdre
+  le texte ; le double `Esc` armé par le conseil actuel le jetterait.
+- **`Error::may_have_succeeded()` dans `gh-client`** : API publique entre crates pour une règle d'affichage d'un
+  seul appelant ; une fonction de `compose.rs` suffit. Reviendrait si un second client de `gh-client` publiait.
+- **5xx de passerelle seulement (502 / 503 / 504) incertains** : un 500 peut suivre l'écriture ; dire « may have
+  been published » à tort coûte un `r`, une double publication coûte un Comment en double visible de tous.
+- **Confirmation avant `q` en Confirm** : un écran de plus pour un cas que « `q` sans effet » règle ; on quitte
+  par `n` puis la fermeture, ou `Ctrl-C`.
 - **Message 422 tiré du texte de GitHub** (« pending review ») : contraire à la règle de `error_message` (jamais de
   texte libre du réseau) ; un message qui couvre la cause fréquente suffit.
 
@@ -801,6 +855,10 @@ Effet sur l'existant :
   `Enter` et vérifie que la liste reste affichée ; il casse en vague 2. Le lot dev[tui-detail] le reprend
   (renommé `selection_is_bounded_and_enter_opens_the_detail` : la sélection reste bornée, `Enter` ouvre le
   détail de la PR choisie).
+- Amendement de #8 : `Signal` perd `Copy` et gagne `Kept(Draft)` (`ui.rs`) ; `PrDetailScreen` gagne un champ
+  `draft`, l'arm `Signal::Kept` et `take_draft` (`pr_detail.rs`, faits par l'architecte avec leurs tests) ;
+  `ComposeScreen::new` gagne `draft` (un seul appelant, `open_compose`) ; `tests/comment.rs` : le 500 devient une
+  publication incertaine (test `a_401_a_404_and_a_500…` repris par dev[tui-compose]).
 - `ui.rs` : variantes d'`Outcome`, `Signal`, `Shared::pop`, `Shared::request_edit`, `View::signal`,
   `View::edited`, `Ui::take_edit`, `Ui::finish_edit`, `Ui::clear` ; écrans existants : rien, confirmé d'après le
   code (leurs `apply` finissent par `other => return Some(other)` : `pulls.rs:208`, `repo_list.rs:506`, `:534`,
@@ -851,9 +909,9 @@ titres des écrans provisoires ; `Outcome::PrPage` porte un `Box<PrPage>` (clipp
 | 1 | dev[client] (sonnet) | `gh-client/src/{client,wire,model}.rs` (corps), `gh-client/tests/http.rs`, `gh-client/tests/fixtures/*.json` (OpenAPI : pull, files, reviews, issue comments, user, review créée, comment créé) | 0 | teste **seul**, sans les routes de dev[fake] (voir « Vague 1 » sous le tableau) ; décodage des exemples documentés ; `archived` lu dans `base.repo` (`true`, `false`, `base.repo` null) ; `mergeable` 3 cas ; PENDING retirée ; état ou statut inconnu = `UnexpectedResponse` ; `patch` absent ou vide = `None` ; `MessageBody` (blanc, 65 536, 65 537, `Debug` sans texte) ; corps JSON des POST lus dans `requests()` (`event`, `body` omis si `None`, `commit_id`) ; 201 / 200 ; 403, 422, 404 classés ; jeton absent des erreurs |
 | 2 | dev[tui-detail] (sonnet) | `ghu/src/ui/{pr_detail,text}.rs`, `ghu/src/ui/pulls.rs` (`Enter`), `ghu/tests/pr_detail.rs`, `ghu/tests/pull_list.rs` (test `Enter` repris) | 1 (fusionnée) et `qa` bout-en-bout client ↔ faux | #6 : `selection_is_bounded_and_enter_opens_the_detail` vert ; chaque critère au harnais (titre, auteur, branches, état, draft, mergeable / conflicts, Markdown, verdicts par reviewer, Pending ignorée, Dismissed, conversation ordonnée, défilement borné, `r`, `Esc` retour, chargement lent, 404 et 500 lisibles) ; lignes d'actions des 4 cas, dont un repo archivé après le chargement puis `r` (actions retirées) ; unitaires `actions`, `verdicts`, `clean`, `markdown` (sans panique sur entrée quelconque) ; fins de ligne `a\r\nb` sans `�`, `a\rb` avec ; test d'échappement du § 7 |
 | 3 | dev[tui-diff] (sonnet) | `ghu/src/ui/diff.rs`, `ghu/tests/diff.rs` | 2 | #7 : liste et compteurs, couleurs (style des cellules lu dans le tampon), `n` / `p` bornés, défilement vertical et horizontal, renommé sans changement, binaire, liste vide, pagination (> 100 fichiers avec `max_per_page` bas), erreur, échappement d'un patch hostile, patch CRLF sans `�` |
-| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête ; `TaskFailed` pendant Publishing (unitaire) : retour à Writing, message « may have been published » |
+| 3 | dev[tui-compose] (sonnet) | `ghu/src/ui/{compose,text_area}.rs` (Comment ; branches `Kind::Review` laissées en `todo!()`), `ghu/tests/comment.rs` | 2 | #8 : saisie multi-ligne et collage, annulation (`Esc` blanc, double `Esc`), refus du texte blanc, écran de confirmation exact, `n` revient au texte, publication reçue par le faux (corps exact), détail rechargé avec le Comment, Comment absent si archivé / fermé / fusionné, 403, limite de débit, 422 et réseau coupé : message, texte conservé, aucune seconde requête ; `TaskFailed` pendant Publishing (unitaire) : retour à Writing, message « may have been published ». **Amendement (relectures de #8)** : `ComposeScreen::new(target, kind, draft)` et `open_compose` de `pr_detail.rs` ; `uncertain` (unitaire par variante : Network, UnexpectedResponse, Api 500 / 502 / 599 oui ; Api 499 / 600, 403, 404, 422, 429, 401 non) ; au harnais : 500 et 502 → message incertain, `Esc` unique après un échec puis `r` puis `c` → texte revenu, puis double `Esc` le jette ; message gardé après frappe ; `q` sans effet en Confirm et en Publishing (aucun POST de plus, écran resté) |
 | 4 | dev[tui-editor] (**opus**) | `ghu/src/editor.rs`, `ghu/src/bin/fake_editor.rs`, `ghu/src/ui/text_area.rs` (`Ctrl-E`, `edited`), `ghu/src/terminal.rs`, `ghu/tests/support/mod.rs`, `ghu/tests/editor.rs` | 3 (tui-compose) | #9 : ordre VISUAL > EDITOR > défaut (unitaire, défaut par `cfg`), découpage avec guillemets (unitaire), aller-retour (`upper`), `write` multi-ligne, introuvable, code 3, non UTF-8, `fill 1048576` accepté et `fill 1048577` = `TooLarge`, `ReturnedAtOnce` (faux éditeur `keep`, seuil du harnais fixé à 30 s) et ses contre-épreuves (`write` rapide : pas de `ReturnedAtOnce` ; `keep` avec un seuil `Duration::ZERO` : texte rendu inchangé, sans erreur), fichier temporaire supprimé ; boucle réelle par `spawn_blocking` ; au harnais : texte revenu dans la zone puis publié ; essai réel par l'utilisateur (vim sous WSL, notepad sous Windows avec une fenêtre Notepad déjà ouverte, `code.cmd --wait`) |
-| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 (Pending ou PR changée) : message exact du § 4, texte conservé |
+| 4 | dev[tui-review] (sonnet) | `ghu/src/ui/compose.rs` (branches Review), `ghu/tests/review.rs`, `ghu/tests/secrecy.rs` (cas de publication) | 3 (tui-compose) | #10 : Approve sans texte et avec texte, Request changes refusé blanc, confirmation avec Verdict, `event` et `commit_id` reçus par le faux, détail rechargé avec le Verdict, Own PR (pas de `a` / `x`, ligne d'explication, `c` marche), PR non ouverte et repo archivé, 422 (Pending ou PR changée) : message exact du § 4, texte conservé ; publication incertaine (`uncertain`, réseau et 502) : message `review` ; après un 422, `Esc` puis `r` puis la même touche (`a` / `x`) rend le texte, l'autre Verdict ouvre une zone vide |
 
 Modèles : `sonnet` (tableau « Agents ») sauf **tui-editor en opus** : protocole fil clavier / terminal / processus
 externe, propre à chaque OS, que les tests au harnais ne couvrent pas (seul l'essai réel le fera) ; une erreur y

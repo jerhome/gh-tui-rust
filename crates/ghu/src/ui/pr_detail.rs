@@ -20,7 +20,7 @@ use super::compose::{ComposeScreen, Kind, Target};
 use super::diff::DiffScreen;
 use super::keys::{self, Binding, HelpRow};
 use super::text::{clean, markdown};
-use super::{Flow, Outcome, RequestId, Shared, Signal, View, error_message};
+use super::{Draft, Flow, Outcome, RequestId, Shared, Signal, View, error_message};
 use crate::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Everything the detail shows, loaded together.
@@ -141,6 +141,8 @@ pub(crate) struct PrDetailScreen {
     rows: RefCell<Option<(usize, Vec<Line<'static>>)>>,
     /// Scroll to the end when the next answer arrives (after a published Comment or Review).
     to_end: bool,
+    /// The text of a compose screen closed after a failed publication (`Signal::Kept`); the latest wins.
+    draft: Option<Draft>,
 }
 
 impl PrDetailScreen {
@@ -156,6 +158,7 @@ impl PrDetailScreen {
             page: Cell::new(0),
             rows: RefCell::new(None),
             to_end: false,
+            draft: None,
         };
         screen.load(shared);
         screen
@@ -195,6 +198,19 @@ impl PrDetailScreen {
     /// A page of scrolling: the rows of the screen but one, so the last line stays in view.
     fn page_rows(&self) -> usize {
         self.page.get().saturating_sub(1).max(1)
+    }
+
+    /// The kept text for `kind` (`Signal::Kept`), moved out; `None` when the draft is of another kind (kept
+    /// then) or there is none.
+    #[allow(
+        dead_code,
+        reason = "ADR 0003 § 4: called by open_compose once ComposeScreen::new takes the draft (dev[tui-compose])"
+    )]
+    fn take_draft(&mut self, kind: Kind) -> Option<String> {
+        if self.draft.as_ref()?.kind != kind {
+            return None;
+        }
+        self.draft.take().map(|draft| draft.text)
     }
 
     /// The compose screen for `kind`, if the loaded PR allows it; nothing otherwise.
@@ -286,13 +302,15 @@ impl View for PrDetailScreen {
         None
     }
 
-    /// [`Signal::Published`]: reloads, then scrolls to the end once the answer arrives.
+    /// [`Signal::Published`]: reloads, then scrolls to the end once the answer arrives. [`Signal::Kept`]: keeps
+    /// the text for the next compose screen of the same kind; nothing is reloaded (the user refreshes with `r`).
     fn signal(&mut self, signal: Signal, shared: &mut Shared) {
         match signal {
             Signal::Published => {
                 self.load(shared);
                 self.to_end = true;
             }
+            Signal::Kept(draft) => self.draft = Some(draft),
         }
     }
 
@@ -929,6 +947,7 @@ mod tests {
             page: Cell::new(0),
             rows: RefCell::new(None),
             to_end: false,
+            draft: None,
         };
         let mut wide = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
         assert!(drawn(&mut wide, &screen).contains("a failure"));
@@ -945,6 +964,64 @@ mod tests {
         assert!(
             other.contains("a failure") && !other.contains("kept rows"),
             "{other}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_draft_is_stored_without_reload_and_given_back_to_the_same_kind_only() {
+        let pull = gh_fake::Pull::new("alice", "notes", 1, "Title", "bob");
+        let (_fake, client) = fake_client(pull, false).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut shared = Shared {
+            client,
+            tx,
+            in_flight: 0,
+            next_id: 0,
+            notice: None,
+            pushed: Vec::new(),
+            popped: None,
+            editor: crate::editor::EditorVars::default(),
+            edit: None,
+        };
+        let mut screen = PrDetailScreen::new(
+            RepoName::new("alice", "notes").expect("repo name"),
+            PrNumber::new(1).expect("number"),
+            &mut shared,
+        );
+        let in_flight = shared.in_flight;
+        let pending = screen.pending;
+        screen.signal(
+            Signal::Kept(Draft {
+                kind: Kind::Comment,
+                text: "kept text".to_owned(),
+            }),
+            &mut shared,
+        );
+        assert_eq!(shared.in_flight, in_flight, "no reload");
+        assert_eq!(screen.pending, pending);
+        assert!(!screen.to_end);
+        // Another kind leaves it in place; the same kind takes it once.
+        assert_eq!(screen.take_draft(Kind::Review(Verdict::Approve)), None);
+        assert_eq!(
+            screen.take_draft(Kind::Comment).as_deref(),
+            Some("kept text")
+        );
+        assert_eq!(screen.take_draft(Kind::Comment), None);
+        // The latest draft wins.
+        for text in ["first", "second"] {
+            screen.signal(
+                Signal::Kept(Draft {
+                    kind: Kind::Review(Verdict::RequestChanges),
+                    text: text.to_owned(),
+                }),
+                &mut shared,
+            );
+        }
+        assert_eq!(
+            screen
+                .take_draft(Kind::Review(Verdict::RequestChanges))
+                .as_deref(),
+            Some("second")
         );
     }
 

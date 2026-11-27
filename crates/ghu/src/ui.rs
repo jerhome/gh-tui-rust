@@ -262,6 +262,15 @@ pub(crate) trait View {
         false
     }
 
+    /// `true` while this screen holds text the user typed and would lose by quitting: then `q` does nothing in
+    /// the help. Defaults to [`View::editing`].
+    fn text_in_progress(&self) -> bool {
+        self.editing()
+    }
+
+    /// Called when the help opens over this screen (any key but `Esc` cancels a pending double `Esc`, ADR 0003).
+    fn help_opened(&mut self) {}
+
     /// Handles a key press. Not called for `Ctrl-C`, nor while the help is shown.
     fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow;
 
@@ -410,7 +419,7 @@ impl App {
     }
 
     /// Key dispatch (ADR 0002): `Ctrl-C` quits from anywhere; any key clears the notice; while the help is shown
-    /// only `?`, `Esc` (close) and `q` (quit) act; while the top screen is editing, it gets every key; otherwise
+    /// only `?`/`F1`, `Esc` (close) and `q` (quit, unless the screen has a text in progress) act; `F1` opens it from any screen; while the top screen is editing, it gets every key; otherwise
     /// the top screen first, then the global table if it returned [`Flow::Ignored`].
     fn key(&mut self, key: KeyEvent) {
         if keys::is_ctrl_c(key) {
@@ -420,10 +429,17 @@ impl App {
         self.shared.notice = None;
         if self.help {
             match keys::lookup(&keys::GLOBAL, key) {
+                // A text in progress is never thrown away by a stray `q` (only `Ctrl-C` quits then).
+                Some(keys::Global::Quit) if self.top().text_in_progress() => {}
                 Some(keys::Global::Quit) => self.finished = true,
                 Some(keys::Global::ToggleHelp | keys::Global::Back) => self.help = false,
                 None => {}
             }
+            return;
+        }
+        // F1 is never text: it opens the help over any screen, a text field included, which keeps its text.
+        if keys::is_f1(key) {
+            self.open_help();
             return;
         }
         let top = self.stack.last_mut().expect("the stack is never empty");
@@ -436,12 +452,20 @@ impl App {
             Flow::Ignored if editing => {}
             Flow::Ignored => match keys::lookup(&keys::GLOBAL, key) {
                 Some(keys::Global::Quit) => self.finished = true,
-                Some(keys::Global::ToggleHelp) => self.help = true,
+                Some(keys::Global::ToggleHelp) => self.open_help(),
                 Some(keys::Global::Back) => self.pop(),
                 None => {}
             },
         }
         self.settle();
+    }
+
+    fn open_help(&mut self) {
+        self.help = true;
+        self.stack
+            .last_mut()
+            .expect("the stack is never empty")
+            .help_opened();
     }
 
     /// After a call on the top screen (key, apply, edited): honours its [`Shared::pop`] request, then stacks the

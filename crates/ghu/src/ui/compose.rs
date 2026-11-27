@@ -112,7 +112,7 @@ const CONFIRM: [Binding<ConfirmAction>; 2] = [
     },
 ];
 
-const WRITING_HINT: &str = " Ctrl-S publish… · Ctrl-E editor · Esc cancel";
+const WRITING_HINT: &str = " Ctrl-S publish… · Ctrl-E editor · Esc cancel · F1 help";
 const CONFIRM_HINT: &str = " y / Enter publish · n / Esc back to the text";
 
 /// Whether GitHub may have created the text although the answer was not a clear success: no answer, an answer
@@ -448,6 +448,14 @@ impl View for ComposeScreen {
         self.phase == Phase::Writing
     }
 
+    fn text_in_progress(&self) -> bool {
+        matches!(self.phase, Phase::Writing | Phase::Confirm)
+    }
+
+    fn help_opened(&mut self) {
+        self.esc_armed = false;
+    }
+
     fn key(&mut self, key: KeyEvent, shared: &mut Shared) -> Flow {
         match self.phase {
             Phase::Writing => self.key_writing(key, shared),
@@ -598,6 +606,8 @@ mod tests {
 
     #[test]
     fn the_key_tables_use_no_reserved_key_and_their_help_fits() {
+        // F1 is not a text key: the writing hint can cite it.
+        assert!(WRITING_HINT.contains("F1 help"));
         assert!(!keys::uses_reserved_key(&WRITING));
         assert!(!keys::uses_reserved_key(&CONFIRM));
         for kind in [

@@ -550,6 +550,23 @@ async fn q_does_nothing_on_the_confirmation_and_while_publishing() {
 }
 
 #[tokio::test]
+async fn f1_in_a_review_keeps_the_text_and_q_in_the_help_does_nothing() {
+    let mut app = review('x').await;
+    app.type_text("why");
+    app.press(KeyCode::F(1));
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    assert_on_screen(&mut app, "Toggle this help");
+    app.press(KeyCode::Esc);
+    assert_on_screen(&mut app, "why");
+    ctrl_s(&mut app);
+    app.press(KeyCode::Char('y'));
+    app.wait_for("Review published: Request changes.").await;
+    app.settle().await;
+    assert_eq!(only_review(&app).body.unwrap()["body"], "why");
+}
+
+#[tokio::test]
 async fn q_is_text_while_writing_a_review() {
     let mut app = review('a').await;
     app.type_text("qq");

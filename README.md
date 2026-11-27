@@ -69,7 +69,7 @@ Global keys:
 
 | Key | Action |
 |---|---|
-| `?` | Toggle the help |
+| `?` or `F1` | Toggle the help (`F1` also works while typing a text) |
 | `Esc` | Back / close the help |
 | `q` | Quit |
 | `Ctrl-C` | Quit |
@@ -133,7 +133,7 @@ Changed files on the left, the unified diff of the selected file on the right (n
 You type the text in the screen, then review what will be published, then confirm. Nothing is sent before the
 confirmation. After a success, the PR detail comes back, reloaded.
 
-While typing, every key is text (`q` and `?` too); arrows, `Home`, `End`, `Backspace`, `Delete` and
+While typing, every key is text (`q` and `?` too) except `F1`, which opens the help of the typing screen (the text is kept); arrows, `Home`, `End`, `Backspace`, `Delete` and
 `Enter` (new line) edit the text, and pasting works.
 
 | Key | Action |

@@ -157,6 +157,85 @@ async fn q_and_question_mark_are_text_while_writing() {
 }
 
 #[tokio::test]
+async fn f1_opens_the_writing_help_without_touching_the_text_and_closing_it_gives_the_text_back() {
+    let mut app = compose().await;
+    app.type_text("a?b");
+    assert!(app.screen().contains("F1 help"), "{}", app.screen());
+    app.press(KeyCode::F(1));
+    let screen = app.screen();
+    for needle in ["Ctrl-S", "Ctrl-E", "Esc", "Toggle this help"] {
+        assert!(screen.contains(needle), "{needle}\n{screen}");
+    }
+    // While the help is shown, text keys do nothing.
+    app.press(KeyCode::Char('z'));
+    app.press(KeyCode::F(1));
+    assert!(!app.screen().contains("Toggle this help"));
+    app.press(KeyCode::F(1));
+    app.press(KeyCode::Esc);
+    let screen = app.screen();
+    assert!(
+        !screen.contains("Toggle this help") && screen.contains(HINT),
+        "{screen}"
+    );
+    assert!(!app.is_finished());
+    app.type_text("c");
+    assert_on_screen(&mut app, "a?bc");
+    assert_eq!(publish_and_read_body(&mut app).await, "a?bc");
+}
+
+#[tokio::test]
+async fn q_in_the_help_opened_while_writing_does_nothing_and_the_text_is_published_intact() {
+    let mut app = compose().await;
+    app.type_text("keep me");
+    app.press(KeyCode::F(1));
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    assert_on_screen(&mut app, "Toggle this help");
+    app.press(KeyCode::Esc);
+    assert_on_screen(&mut app, "keep me");
+    assert_eq!(publish_and_read_body(&mut app).await, "keep me");
+}
+
+#[tokio::test]
+async fn f1_on_the_confirmation_publishes_nothing_and_q_in_its_help_does_nothing() {
+    let mut app = compose().await;
+    app.type_text("sure");
+    ctrl_s(&mut app);
+    app.press(KeyCode::F(1));
+    assert_on_screen(&mut app, "Toggle this help");
+    app.press(KeyCode::Char('y'));
+    app.press(KeyCode::Char('q'));
+    assert!(!app.is_finished());
+    assert!(posts(&app).is_empty());
+    app.press(KeyCode::Esc);
+    assert_on_screen(&mut app, "y / Enter publish · n / Esc back to the text");
+    assert!(posts(&app).is_empty());
+    app.press(KeyCode::Char('y'));
+    app.wait_for("Comment published.").await;
+    app.settle().await;
+    assert_eq!(only_posted_body(&app), "sure");
+}
+
+#[tokio::test]
+async fn opening_the_help_disarms_the_double_esc() {
+    let mut app = compose().await;
+    app.type_text("draft");
+    app.press(KeyCode::Esc);
+    app.press(KeyCode::F(1));
+    app.press(KeyCode::Esc); // closes the help
+    app.press(KeyCode::Esc);
+    let screen = app.screen();
+    assert!(
+        screen.contains("Press Esc again to discard the text."),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("· Comment") && screen.contains("draft"),
+        "{screen}"
+    );
+}
+
+#[tokio::test]
 async fn editing_keys_move_insert_and_delete_inside_a_line() {
     let mut app = compose().await;
     app.type_text("Helo");

@@ -4,7 +4,7 @@
 //! error wins) as one [`Outcome::PrPage`]. Opens [`super::diff::DiffScreen`] (`d`) and
 //! [`super::compose::ComposeScreen`] (`c`, `a`, `x`, only as [`actions`] allows).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use gh_client::{
     Comment, Mergeable, PrNumber, PrState, PullDetail, RepoName, Review, ReviewState, Timestamp,
@@ -137,6 +137,8 @@ pub(crate) struct PrDetailScreen {
     /// Largest useful `scroll` and rows per screen, measured by the last render (key handling has no frame).
     max_scroll: Cell<usize>,
     page: Cell<usize>,
+    /// The wrapped rows of the content and the width they were wrapped to; emptied by each new `Load`.
+    rows: RefCell<Option<(usize, Vec<Line<'static>>)>>,
     /// Scroll to the end when the next answer arrives (after a published Comment or Review).
     to_end: bool,
 }
@@ -152,6 +154,7 @@ impl PrDetailScreen {
             scroll: 0,
             max_scroll: Cell::new(0),
             page: Cell::new(0),
+            rows: RefCell::new(None),
             to_end: false,
         };
         screen.load(shared);
@@ -262,6 +265,7 @@ impl View for PrDetailScreen {
                     "pull request loaded"
                 );
                 self.load = Load::Loaded(page);
+                self.rows.take();
                 if std::mem::take(&mut self.to_end) {
                     self.scroll = usize::MAX;
                 }
@@ -270,10 +274,12 @@ impl View for PrDetailScreen {
                 tracing::warn!(%error, "loading the pull request failed");
                 self.to_end = false;
                 self.load = Load::Failed(error_message("load the pull request", &error));
+                self.rows.take();
             }
             Outcome::TaskFailed => {
                 self.to_end = false;
                 self.load = Load::Failed(super::TASK_FAILED.to_owned());
+                self.rows.take();
             }
             other => return Some(other),
         }
@@ -293,19 +299,28 @@ impl View for PrDetailScreen {
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let width = usize::from(area.width.saturating_sub(2));
         let height = usize::from(area.height.saturating_sub(2));
-        let lines = match &self.load {
-            Load::Loading => Vec::new(),
-            Load::Loaded(page) => content_lines(page),
-            Load::Failed(message) => vec![Line::from(message.clone()).red()],
-        };
-        let rows: Vec<Line<'static>> = lines.iter().flat_map(|line| wrap(line, width)).collect();
+        let mut cache = self.rows.borrow_mut();
+        if cache
+            .as_ref()
+            .is_none_or(|(wrapped_to, _)| *wrapped_to != width)
+        {
+            let lines = match &self.load {
+                Load::Loading => Vec::new(),
+                Load::Loaded(page) => content_lines(page),
+                Load::Failed(message) => vec![Line::from(message.clone()).red()],
+            };
+            let rows = lines.iter().flat_map(|line| wrap(line, width)).collect();
+            *cache = Some((width, rows));
+        }
+        let rows = &cache.as_ref().expect("filled above").1;
         let max = rows.len().saturating_sub(height);
         self.max_scroll.set(max);
         self.page.set(height);
         let visible: Vec<Line<'static>> = rows
-            .into_iter()
+            .iter()
             .skip(self.scroll.min(max))
             .take(height)
+            .cloned()
             .collect();
         frame.render_widget(Paragraph::new(visible).block(Block::bordered()), area);
     }
@@ -453,39 +468,77 @@ fn conversation(page: &PrPage) -> Vec<Line<'static>> {
     lines
 }
 
-/// `line` cut into rows of at most `width` characters: at the last space that fits, else inside the word. Styles
-/// are kept. Always at least one row. (Characters are counted, not their display width: a wide character may
-/// overflow its row, which the terminal clips.)
+/// One grapheme-like cluster of a line: a character with the zero-width ones that follow it (combining marks,
+/// variation selectors) and, after a zero-width joiner, the next character. Never cut in two.
+struct Cluster {
+    text: String,
+    style: Style,
+    /// Display width in columns (`Span::width`, i.e. unicode-width of the whole cluster).
+    width: usize,
+}
+
+/// The clusters of `line`, each with the style of its first character.
+fn clusters(line: &Line<'_>) -> Vec<Cluster> {
+    let width_of = |text: &str| Span::raw(text).width();
+    let mut cells: Vec<Cluster> = Vec::new();
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for c in span.content.chars() {
+            let mut buf = [0; 4];
+            let one = &*c.encode_utf8(&mut buf);
+            match cells.last_mut() {
+                Some(last) if last.text.ends_with('\u{200d}') || width_of(one) == 0 => {
+                    last.text.push(c);
+                    last.width = width_of(&last.text);
+                }
+                _ => cells.push(Cluster {
+                    text: one.to_owned(),
+                    style,
+                    width: width_of(one),
+                }),
+            }
+        }
+    }
+    cells
+}
+
+/// `line` cut into rows of at most `width` columns: at the last space that fits, else inside the word. Styles are
+/// kept. Always at least one row. A cluster wider than `width` (a wide character at width 1) gets a row of its
+/// own and overflows it: nothing narrower exists, and nothing is lost.
 fn wrap(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let cells: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|span| {
-            let style = line.style.patch(span.style);
-            span.content.chars().map(move |c| (c, style))
-        })
-        .collect();
-    let mut rows: Vec<&[(char, Style)]> = Vec::new();
+    let cells = clusters(line);
+    let mut rows: Vec<&[Cluster]> = Vec::new();
     let mut rest = cells.as_slice();
     loop {
-        if rest.len() <= width {
+        let total: usize = rest.iter().map(|cell| cell.width).sum();
+        if total <= width || rest.len() == 1 {
             rows.push(rest);
             break;
         }
-        // A space at index 0..=width ends a row (the space is dropped), unless the row would be only spaces.
-        let at = rest[..=width]
+        // The clusters that fit (at least one, to make progress).
+        let mut used = 0;
+        let fit = rest
             .iter()
-            .rposition(|&(c, _)| c == ' ')
-            .filter(|&at| rest[..at].iter().any(|&(c, _)| c != ' '));
+            .take_while(|cell| {
+                used += cell.width;
+                used <= width
+            })
+            .count()
+            .max(1);
+        // A space at index 0..=fit ends a row (the space is dropped), unless the row would be only spaces.
+        let at = rest[..=fit]
+            .iter()
+            .rposition(|cell| cell.text == " ")
+            .filter(|&at| rest[..at].iter().any(|cell| cell.text != " "));
         match at {
             Some(at) => {
                 rows.push(&rest[..at]);
                 rest = &rest[at + 1..];
             }
             None => {
-                rows.push(&rest[..width]);
-                rest = &rest[width..];
+                rows.push(&rest[..fit]);
+                rest = &rest[fit..];
             }
         }
         if rest.is_empty() {
@@ -495,17 +548,17 @@ fn wrap(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
     rows.into_iter().map(row_line).collect()
 }
 
-/// A row of styled characters as a `Line`, consecutive characters of the same style in one span.
-fn row_line(row: &[(char, Style)]) -> Line<'static> {
+/// A row of clusters as a `Line`, consecutive clusters of the same style in one span.
+fn row_line(row: &[Cluster]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current = String::new();
     let mut style = Style::new();
-    for &(c, cell_style) in row {
-        if !current.is_empty() && cell_style != style {
+    for cell in row {
+        if !current.is_empty() && cell.style != style {
             spans.push(Span::styled(std::mem::take(&mut current), style));
         }
-        style = cell_style;
-        current.push(c);
+        style = cell.style;
+        current.push_str(&cell.text);
     }
     if !current.is_empty() {
         spans.push(Span::styled(current, style));
@@ -584,9 +637,11 @@ mod tests {
     use ratatui::style::Modifier;
     use tokio::sync::mpsc;
 
-    /// The detail, the reviews and the signed-in user (`alice`) of PR #1 of `alice/notes` as the client reads
-    /// them from the fake: the model types are built by `gh-client` only.
-    async fn fetch(pull: gh_fake::Pull, archived: bool) -> (PullDetail, Vec<Review>, User) {
+    use crate::ui::text::Rng;
+
+    /// A fake server holding PR #1 of `alice/notes` (signed-in user `alice`) and a client for it; the server
+    /// stops when it is dropped.
+    async fn fake_client(pull: gh_fake::Pull, archived: bool) -> (FakeGitHub, Client) {
         let mut state = State::new(gh_fake::User {
             login: "alice".into(),
             id: 1,
@@ -602,6 +657,13 @@ mod tests {
             Token::new(token).expect("token"),
         )
         .expect("client");
+        (fake, client)
+    }
+
+    /// The detail, the reviews and the signed-in user (`alice`) of PR #1 of `alice/notes` as the client reads
+    /// them from the fake: the model types are built by `gh-client` only.
+    async fn fetch(pull: gh_fake::Pull, archived: bool) -> (PullDetail, Vec<Review>, User) {
+        let (_fake, client) = fake_client(pull, archived).await;
         let name = RepoName::new("alice", "notes").expect("repo name");
         let number = PrNumber::new(1).expect("number");
         let detail = client.pull(&name, number).await.expect("pull");
@@ -797,25 +859,40 @@ mod tests {
 
     #[test]
     fn wrap_never_loses_a_character_nor_overflows_a_row() {
-        const POOL: [&str; 6] = ["a", "b", "é", "日", " ", "  "];
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            usize::try_from(state % 1000).expect("small")
-        };
-        for _ in 0..2000 {
-            let len = next() % 30;
-            let text: String = (0..len).map(|_| POOL[next() % POOL.len()]).collect();
-            let width = next() % 8;
-            let rows = texts(&wrap(&Line::from(text.clone()), width));
+        const POOL: [&str; 10] = [
+            "a",
+            "b",
+            "é",
+            "e\u{301}",
+            "日",
+            "😀",
+            "👨\u{200d}👩",
+            "\u{301}",
+            " ",
+            "  ",
+        ];
+        // A cluster wider than the row gets a row of its own and overflows: nothing narrower can.
+        let widest = POOL
+            .iter()
+            .map(|c| Span::raw(*c).width())
+            .max()
+            .expect("pool");
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..3000 {
+            let len = rng.below(30);
+            let text: String = (0..len).map(|_| POOL[rng.below(POOL.len())]).collect();
+            let width = rng.below(9);
+            let wrapped = wrap(&Line::from(text.clone()), width);
+            let rows = texts(&wrapped);
             assert!(!rows.is_empty());
-            for row in &rows {
+            for row in &wrapped {
                 assert!(
-                    row.chars().count() <= width.max(1),
+                    row.width() <= width.max(widest),
                     "{text:?} at {width}: {rows:?}"
                 );
+                if width >= widest {
+                    assert!(row.width() <= width, "{text:?} at {width}: {rows:?}");
+                }
             }
             let kept: String = rows.concat().chars().filter(|c| *c != ' ').collect();
             let wanted: String = text.chars().filter(|c| *c != ' ').collect();
@@ -840,6 +917,37 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn the_wrapped_rows_are_kept_until_the_width_changes() {
+        let screen = PrDetailScreen {
+            repo: RepoName::new("alice", "notes").expect("repo name"),
+            number: PrNumber::new(1).expect("number"),
+            load: Load::Failed("a failure".to_owned()),
+            pending: None,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            page: Cell::new(0),
+            rows: RefCell::new(None),
+            to_end: false,
+        };
+        let mut wide = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
+        assert!(drawn(&mut wide, &screen).contains("a failure"));
+        // Same width: the kept rows are drawn again, not recomputed (a marker put in the cache shows).
+        screen.rows.borrow_mut().as_mut().expect("cached").1 = vec![Line::from("kept rows")];
+        let again = drawn(&mut wide, &screen);
+        assert!(
+            again.contains("kept rows") && !again.contains("a failure"),
+            "{again}"
+        );
+        // Another width: wrapped again.
+        let mut narrow = Terminal::new(TestBackend::new(40, 10)).expect("terminal");
+        let other = drawn(&mut narrow, &screen);
+        assert!(
+            other.contains("a failure") && !other.contains("kept rows"),
+            "{other}"
+        );
+    }
+
     #[tokio::test]
     async fn after_a_published_signal_the_reload_scrolls_to_the_end_once_it_arrives() {
         let mut pull = gh_fake::Pull::new("alice", "notes", 1, "Long", "bob");
@@ -849,19 +957,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        let mut state = State::new(gh_fake::User {
-            login: "alice".into(),
-            id: 1,
-        });
-        state.repos = vec![gh_fake::Repo::new("alice", "notes")];
-        state.pulls = vec![pull];
-        let token = state.token.clone();
-        let fake = FakeGitHub::start(state).await.expect("fake server");
-        let client = Client::new(
-            ApiBase::parse(&fake.base_url()).expect("base url"),
-            Token::new(token).expect("token"),
-        )
-        .expect("client");
+        let (_fake, client) = fake_client(pull, false).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut shared = Shared {
             client,
@@ -882,6 +978,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
         let (id, outcome) = rx.recv().await.expect("first answer");
         assert!(screen.apply(id, outcome, &mut shared).is_none());
+        assert!(
+            screen.rows.borrow().is_none(),
+            "a new load empties the cache"
+        );
         let top = drawn(&mut terminal, &screen);
         assert!(
             top.contains("line 001") && !top.contains("No comments."),

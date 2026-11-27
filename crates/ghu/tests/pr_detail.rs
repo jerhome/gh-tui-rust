@@ -810,6 +810,33 @@ async fn long_lines_wrap_and_nothing_is_lost() {
 }
 
 #[tokio::test]
+async fn wide_characters_are_wrapped_by_columns_and_never_lost() {
+    // 240 Japanese characters without a space: 480 columns on rows of 98.
+    let mut pull = pr(1, "T", "bob");
+    pull.body = Some("日本語".repeat(80));
+    let mut app = open_detail(state_with(vec![pull]), 1).await;
+    let screen = app.screen();
+    let kept = screen
+        .chars()
+        .filter(|c| matches!(c, '日' | '本' | '語'))
+        .count();
+    assert_eq!(kept, 240, "{screen}");
+    // An emoji that would straddle the end of a full row goes to the next row instead of being clipped.
+    let mut pull = pr(1, "T", "bob");
+    pull.body = Some(format!("{}😀 end", "a".repeat(95)));
+    let mut app = open_detail(state_with(vec![pull]), 1).await;
+    let screen = app.screen();
+    assert_eq!(screen.matches('😀').count(), 1, "{screen}");
+    // A combining accent and a joined sequence stay with their base.
+    let mut pull = pr(1, "T", "bob");
+    pull.body = Some(format!("{}e\u{301} 👨\u{200d}👩 end", "a".repeat(95)));
+    let mut app = open_detail(state_with(vec![pull]), 1).await;
+    let screen = app.screen();
+    assert!(screen.contains("e\u{301}"), "{screen}");
+    assert!(screen.contains("👨\u{200d}👩"), "{screen}");
+}
+
+#[tokio::test]
 async fn network_text_never_reaches_the_terminal_raw() {
     let hostile = "bad \u{1b}[31mred\u{202e}x a\rb";
     let mut pull = pr(1, "T\u{1b}[2Jitle \u{202e}", "bob");

@@ -1374,7 +1374,6 @@ async fn a_missing_non_string_or_blank_comment_body_is_422() {
         json!({"body": null}),
         json!({"body": ""}),
         json!({"body": " \n\t "}),
-        json!([1]),
     ] {
         let resp = post(&fake, path, &body).await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
@@ -1389,10 +1388,39 @@ async fn a_missing_non_string_or_blank_comment_body_is_422() {
         .send()
         .await
         .unwrap();
-    assert_eq!(raw.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(raw.status(), StatusCode::BAD_REQUEST);
+    let json: Value = raw.json().await.unwrap();
+    assert_eq!(json["message"], "Problems parsing JSON");
+    assert!(json["documentation_url"].is_string());
+    let array = post(&fake, path, &json!([1])).await;
+    assert_eq!(array.status(), StatusCode::BAD_REQUEST, "not an object");
     assert_eq!(
         fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().comments.len()),
         2
+    );
+    assert_eq!(fake.with_state(|s| s.next_id), 1_000_000, "no id consumed");
+}
+
+#[tokio::test]
+async fn a_review_body_that_is_not_a_json_object_is_a_400_and_creates_nothing() {
+    let fake = adr_fake().await;
+    let before = fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().reviews.len());
+    let raw = client()
+        .post(format!("{}{R1}", fake.base_url()))
+        .header("Authorization", format!("Bearer {DEFAULT_TOKEN}"))
+        .body("not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), StatusCode::BAD_REQUEST);
+    let json: Value = raw.json().await.unwrap();
+    assert_eq!(json["message"], "Problems parsing JSON");
+    assert!(json["documentation_url"].is_string());
+    let array = post(&fake, R1, &json!(["APPROVE"])).await;
+    assert_eq!(array.status(), StatusCode::BAD_REQUEST, "not an object");
+    assert_eq!(
+        fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().reviews.len()),
+        before
     );
     assert_eq!(fake.with_state(|s| s.next_id), 1_000_000, "no id consumed");
 }
@@ -1625,6 +1653,12 @@ async fn publishing_reviews_records_state_commit_body_and_time() {
         assert_eq!(json["commit_id"], *commit);
         assert_eq!(json["user"]["login"], "alice");
         assert_eq!(json["submitted_at"], NOW);
+        assert_eq!(
+            fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().updated_at.clone()),
+            NOW,
+            "a submitted review touches the pull"
+        );
+        fake.with_state(|s| s.pull_mut("alice", "notes", 1).unwrap().updated_at = "old".into());
     }
     let list: Value = authed(&fake, R1).await.json().await.unwrap();
     let ids: Vec<_> = list

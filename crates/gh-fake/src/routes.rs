@@ -649,11 +649,15 @@ async fn issue_comments(
     paginated(&app, &path, &query, &items, max)
 }
 
-/// The JSON object of a POST body; anything else (invalid JSON, array, scalar) reads as an empty object.
-fn json_object(body: &Bytes) -> serde_json::Map<String, Value> {
+/// The JSON object of a POST body; anything else (invalid JSON, array, scalar) is a 400 like GitHub's.
+fn json_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Box<Response>> {
     match serde_json::from_slice(body) {
-        Ok(Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
+        Ok(Value::Object(map)) => Ok(map),
+        _ => Err(Box::new(message(
+            StatusCode::BAD_REQUEST,
+            RATE_LIMIT - 1,
+            "Problems parsing JSON",
+        ))),
     }
 }
 
@@ -687,7 +691,10 @@ async fn create_comment(
         return archived_response();
     }
     let (owner, repo_name, number) = (pull.owner.clone(), pull.repo.clone(), pull.number);
-    let object = json_object(&body);
+    let object = match json_object(&body) {
+        Ok(object) => object,
+        Err(response) => return *response,
+    };
     if text_field(&object, "body").is_none() {
         return error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -748,7 +755,10 @@ async fn create_review(
     if repo.archived {
         return archived_response();
     }
-    let object = json_object(&body);
+    let object = match json_object(&body) {
+        Ok(object) => object,
+        Err(response) => return *response,
+    };
     let me = state.user.login.clone();
     let event = object.get("event");
     let event_text = event.map(|e| e.as_str().unwrap_or("?"));
@@ -810,7 +820,11 @@ async fn create_review(
     };
     state.next_id += 1;
     let json = review_json(&review, &state);
+    let now = state.now.clone();
     if let Some(pull) = state.pull_mut(&owner, &repo_name, number) {
+        if review.state != ReviewState::Pending {
+            pull.updated_at = now;
+        }
         pull.reviews.push(review);
     }
     axum::Json(json).into_response()

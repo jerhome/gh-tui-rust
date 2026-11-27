@@ -29,12 +29,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # The version comes from rust-toolchain.toml only (never "stable").
       - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup default stable
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustup default "$channel"
           rustc --version
           cargo --version
+          rustc --version | grep -F "rustc $channel "
       # Swatinem/rust-cache v2.9.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Format
@@ -60,12 +64,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # The version comes from rust-toolchain.toml only (never "stable").
       - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
           rustc --version
           cargo --version
+          rustc --version | grep -F "rustc $channel "
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Build
         run: cargo build --workspace --all-targets --locked

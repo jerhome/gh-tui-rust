@@ -1,0 +1,261 @@
+name: Release
+
+# The release publishes the bytes that were tried by hand:
+#   tag vX.Y.Z-rc.N : build 3 targets, checksum, publish a pre-release.
+#   (manual trial on the rc assets)
+#   tag vX.Y.Z      : NO rebuild. Promote the newest rc pre-release of the same commit: same archives and
+#                     SHA256SUMS in a final release. Fails clearly if there is no such rc.
+# Push to a wip-*-release branch, or workflow_dispatch: same build, artifacts only; a release is created only when
+# run on a v* tag (with publish=true for a manual run).
+on:
+  push:
+    tags: ["v*"]
+    # Dry run of the release build on a branch (artifacts only, never published).
+    branches: ["wip-*-release"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release (only honoured when the run is on a v* tag)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kind:
+    name: Kind of run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      final: ${{ steps.kind.outputs.final }}
+    steps:
+      - id: kind
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          final=false
+          # A final tag is v<digits>.<digits>.<digits> with no suffix.
+          if [ "$REF_TYPE" = "tag" ] && printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            final=true
+          fi
+          echo "final=$final" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: kind
+    if: needs.kind.outputs.final != 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: ghu
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: ghu.exe
+            ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe: ghu
+            ext: tar.gz
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          # v0.1.0-rc.2 -> v0.1.0
+          base="${REF_NAME%%-*}"
+          if [ "$REF_TYPE" = "tag" ] && [ "$base" != "v$version" ]; then
+            echo "::error::tag $REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The version comes from rust-toolchain.toml only (never "stable").
+      - name: Toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --target "$TARGET"
+          rustup default "$channel"
+          rustc --version
+          cargo --version
+          rustc --version | grep -F "rustc $channel "
+      # Swatinem/rust-cache v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: release-${{ matrix.target }}
+      # ghu only: gh-fake and ghu-fake-editor are test tools and are never built here.
+      - name: Build
+        run: cargo build --release --locked -p ghu --bin ghu --target ${{ matrix.target }}
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          name="ghu-$VERSION-$TARGET"
+          mkdir -p "stage/$name" dist
+          cp "target/$TARGET/release/$EXE" "stage/$name/"
+          cp README.md LICENSE* "stage/$name/" 2>/dev/null || true
+          if [ "$EXT" = "zip" ]; then
+            (cd stage && 7z a -tzip "../dist/$name.zip" "$name" > /dev/null)
+          else
+            tar -C stage -czf "dist/$name.tar.gz" "$name"
+          fi
+          if [ "$EXT" = "zip" ]; then 7z l "dist/$name.zip" > content.txt; else tar -tzf "dist/$name.tar.gz" > content.txt; fi
+          echo "== content of dist/$name.$EXT"
+          cat content.txt
+          if grep -E 'gh-fake|ghu-fake-editor' content.txt; then
+            echo "::error::test tool found in the archive"
+            exit 1
+          fi
+      # actions/upload-artifact v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ghu-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/download-artifact v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: ghu-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+          sha256sum -- * | tee SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  # Tag vX.Y.Z-rc.N: pre-release from the artifacts built in this run.
+  publish:
+    name: Publish pre-release
+    needs: [kind, build, checksums]
+    if: needs.kind.outputs.final != 'true' && startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          notes="docs/release-notes-${version%.*}.md"
+          test -f "$notes"
+          # A tag without suffix never reaches this job (see "kind"); an rc is always a pre-release.
+          case "$TAG" in
+            *-rc.*) ;;
+            *) echo "::error::tag $TAG is neither vX.Y.Z nor vX.Y.Z-rc.N"; exit 1 ;;
+          esac
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file "$notes" --prerelease
+
+  # Tag vX.Y.Z: no build. Re-publish the assets of the newest rc pre-release on the same commit.
+  promote:
+    name: Promote rc to final release
+    needs: kind
+    if: needs.kind.outputs.final == 'true' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match workspace version $version"
+            exit 1
+          fi
+          notes="docs/release-notes-${version%.*}.md"
+          test -f "$notes"
+          # Candidate rc pre-releases of this version, newest first (version sort).
+          gh release list --limit 100 --json tagName,isPrerelease,isDraft \
+            --jq ".[] | select(.isPrerelease and (.isDraft | not)) | .tagName | select(startswith(\"$TAG-rc.\"))" \
+            | sort -V -r > candidates.txt
+          rc=""
+          while read -r cand; do
+            [ -n "$cand" ] || continue
+            commit=$(gh api "repos/$GH_REPO/commits/$cand" --jq .sha)
+            if [ "$commit" = "$SHA" ]; then rc="$cand"; break; fi
+            echo "skip $cand ($commit is not $SHA)"
+          done < candidates.txt
+          if [ -z "$rc" ]; then
+            echo "::error::no pre-release $TAG-rc.N on commit $SHA: tag a release candidate first, try it, then tag $TAG on the same commit"
+            exit 1
+          fi
+          echo "promoting $rc"
+          mkdir dist
+          gh release download "$rc" --dir dist
+          ls -l dist
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd dist && sha256sum --check SHA256SUMS)
+          for t in x86_64-unknown-linux-gnu.tar.gz x86_64-pc-windows-msvc.zip aarch64-apple-darwin.tar.gz; do
+            test -f "dist/ghu-$version-$t"
+          done
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file "$notes" --latest

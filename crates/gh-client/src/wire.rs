@@ -648,7 +648,9 @@ mod tests {
     // ---- ADR 0003: detail, reviews, comments, files, user ----
     // Examples taken from the GitHub OpenAPI description (rest-api-description): "Get a pull request",
     // "List reviews for a pull request", "Create a review for a pull request", "List issue comments",
-    // "Create an issue comment", "List pull requests files", "Get the authenticated user".
+    // "Create an issue comment", "List pull requests files", "Get the authenticated user". Fixtures are copies of
+    // components.examples: pull-request, pull-request-review-items, pull-request-review, issue-comment-items,
+    // issue-comment, diff-entry-items, private-user-response-with-public-and-private-profile-information.
     const PULL_DETAIL_EXAMPLE: &str = include_str!("../tests/fixtures/pull.json");
     const REVIEWS_EXAMPLE: &str = include_str!("../tests/fixtures/reviews.json");
     const REVIEW_CREATED_EXAMPLE: &str = include_str!("../tests/fixtures/review_created.json");

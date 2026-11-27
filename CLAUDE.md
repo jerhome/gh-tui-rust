@@ -65,6 +65,15 @@ The five default labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready
 
 Single-context: `GLOSSARY.md` at the root (English) and `docs/adr/`. See `docs/agents/domain.md`.
 
+### Retro
+
+`.claude/skills/retro/SKILL.md` : rétro fusionnée (mattpocock + agents-home), lancée par l'utilisateur seulement.
+
+### Handoff
+
+`.claude/skills/handoff/SKILL.md` : passation vers `docs/reprise.md` et `CLAUDE.local.md` (pas `/tmp`), lancée par
+l'utilisateur seulement.
+
 ## Skills mattpocock et agents de base combinés
 
 Les skills mattpocock donnent la méthode, les agents d'agents-home font le travail. Les agents n'ont pas l'outil

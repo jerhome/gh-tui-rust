@@ -32,7 +32,7 @@ fn needs_cleaning(c: char) -> bool {
 
 /// The Markdown subset of ADR 0003 § 4 as styled lines: `text` split with `str::lines()`, each line cleaned
 /// ([`clean`]), `indent` spaces before each line. Headings `#`..`######` bold, bullets `•`, fenced blocks
-/// (three backticks or `~~~`) indented by two more spaces and dimmed, `**x**` / `__x__` bold, ``x`` code
+/// (three backticks, without a backtick after them on the line, or `~~~`) indented by two more spaces and dimmed, `**x**` / `__x__` bold, ``x`` code
 /// style; links, images, HTML, tables and quotes left as text. Never panics.
 pub(crate) fn markdown(text: &str, indent: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -73,12 +73,15 @@ pub(crate) fn markdown(text: &str, indent: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// ``` ` `` or `~` when `line` starts (after spaces) with three of them.
+/// `` ` `` or `~` when `line` starts (after spaces) with three of them. A backtick fence takes no backtick in the
+/// rest of the line (CommonMark): ```cargo test``` is inline code, not a fence.
 fn fence_marker(line: &str) -> Option<char> {
     let trimmed = line.trim_start();
-    ['`', '~']
-        .into_iter()
-        .find(|&marker| trimmed.chars().take(3).filter(|&c| c == marker).count() == 3)
+    let run = |marker: char| trimmed.chars().take_while(|&c| c == marker).count();
+    if run('~') >= 3 {
+        return Some('~');
+    }
+    (run('`') >= 3 && !trimmed[run('`')..].contains('`')).then_some('`')
 }
 
 /// The spans of one line outside a fenced block: heading, bullet or plain text with inline styles.
@@ -154,6 +157,25 @@ fn styled_run(rest: &str, before: Option<char>) -> Option<(usize, &str, Style)> 
         &inner[..end],
         Style::new().add_modifier(Modifier::BOLD),
     ))
+}
+
+/// Deterministic generator for tests (xorshift64, fixed seed): no dependency, same inputs on every run.
+#[cfg(test)]
+pub(crate) struct Rng(pub(crate) u64);
+
+#[cfg(test)]
+impl Rng {
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A number in `0..bound` (`bound` is small and not 0).
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(bound).expect("small")).expect("small")
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn markdown_does_not_open_a_backtick_fence_whose_info_string_has_a_backtick() {
+        // CommonMark: ```cargo test``` is inline code, not a fence; a tilde fence may have backticks in its info.
+        let got = rendered("```cargo test```\nafter", 0);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].contains("cargo test"), "{got:?}");
+        assert_eq!(got[1], "after");
+        assert_eq!(rendered("```rust\nx\n```", 0), ["  x"]);
+        assert_eq!(rendered("~~~a`b\nx\n~~~", 0), ["  x"]);
+        assert_eq!(rendered("  ```\nx\n```", 0), ["  x"]);
+    }
+
+    #[test]
     fn markdown_adds_the_indent_to_every_line() {
         assert_eq!(
             rendered("a\n\n- b\n```\nc\n```", 2),
@@ -342,18 +376,6 @@ mod tests {
         assert_eq!(rendered("**\u{1b}[31m**", 0), ["\u{fffd}[31m"]);
         assert_eq!(rendered("```\n\u{202e}x\n```", 0), ["  \u{fffd}x"]);
         assert_eq!(rendered("- \u{9b}", 0), ["• \u{fffd}"]);
-    }
-
-    /// Deterministic generator (xorshift64, fixed seed): no dependency, same inputs on every run.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
     }
 
     #[test]
@@ -392,11 +414,9 @@ mod tests {
         ];
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for _ in 0..3000 {
-            let len = usize::try_from(rng.next() % 40).expect("small");
-            let text: String = (0..len)
-                .map(|_| POOL[usize::try_from(rng.next() % 30).expect("small")])
-                .collect();
-            let indent = usize::try_from(rng.next() % 4).expect("small");
+            let len = rng.below(40);
+            let text: String = (0..len).map(|_| POOL[rng.below(30)]).collect();
+            let indent = rng.below(4);
             for line in markdown(&text, indent) {
                 for span in &line.spans {
                     for c in span.content.chars() {
